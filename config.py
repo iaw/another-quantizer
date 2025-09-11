@@ -1,11 +1,14 @@
 # config.py
 """Configuration settings for GLM sequential quantization"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 import yaml
 import json
+import torch
+import psutil
+import logging
 
 
 @dataclass
@@ -19,7 +22,7 @@ class QuantizationConfig:
     
     # Quantization settings
     bits: int = 4
-    group_size: int = 32
+    group_size: int = 128  # AWQ recommended default
     symmetric: bool = False
     
     # Memory settings
@@ -32,75 +35,156 @@ class QuantizationConfig:
     calibration_batch_size: int = 2
     checkpoint_every_n_layers: int = 5
     
-    # Layer settings
-    skip_layers: List[str] = field(default_factory=lambda: ["lm_head", "*.mlp.gate"])
+    # Layer settings - GLM4.5 specific patterns
+    skip_layers: List[str] = field(default_factory=lambda: [
+        "lm_head",
+        "output_layer",
+        "*.layernorm",
+        "*.ln_f",
+        "*.input_layernorm",
+        "*.post_attention_layernorm",
+        "embedding*",
+        "*.router",  # MoE routers stay in FP16
+    ])
     
     # AWQ specific settings
     awq_damping_percent: float = 0.01
     awq_desc_act: bool = False
     awq_true_sequential: bool = True
+    awq_protection_factor: float = 1.5  # For salient channels
     
     def __post_init__(self):
         """Initialize default values and validate config"""
         # Convert paths to Path objects
-        # Set up default skip patterns for GLM
-        # Validate memory settings against available hardware
-        # Initialize logging configuration
-        pass
+        self.model_path = Path(self.model_path)
+        self.output_path = Path(self.output_path)
+        self.checkpoint_dir = Path(self.checkpoint_dir)
+        
+        # Auto-detect available memory if not set
+        if self.max_gpu_memory == 20 and torch.cuda.is_available():
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+            # Use 90% of available GPU memory
+            self.max_gpu_memory = int(gpu_mem * 0.9)
+            
+        if self.max_cpu_memory == 200:
+            cpu_mem = psutil.virtual_memory().total / 1e9
+            # Use 80% of available CPU memory
+            self.max_cpu_memory = int(cpu_mem * 0.8)
+        
+        # Validate configuration
+        self.validate()
     
     def validate(self) -> bool:
         """Validate configuration settings"""
+        errors = []
+        
         # Check if model_path exists
-        # Verify output_path is writable
+        if not self.model_path.exists():
+            errors.append(f"Model path does not exist: {self.model_path}")
+        
+        # Verify output_path parent exists and is writable
+        if not self.output_path.parent.exists():
+            errors.append(f"Output directory parent does not exist: {self.output_path.parent}")
+        
         # Ensure memory limits are reasonable
-        # Validate quantization parameters (bits in [3,4,8])
-        # Check GPU availability if not offload_to_cpu
-        # Return True if all valid, raise ConfigError otherwise
-        pass
+        if self.max_gpu_memory < 4:
+            errors.append(f"GPU memory limit too low: {self.max_gpu_memory}GB")
+        
+        if self.max_cpu_memory < 16:
+            errors.append(f"CPU memory limit too low: {self.max_cpu_memory}GB")
+        
+        # Validate quantization parameters
+        if self.bits not in [3, 4, 8]:
+            errors.append(f"Bits must be 3, 4, or 8, got: {self.bits}")
+        
+        if self.group_size not in [-1, 32, 64, 128, 256]:
+            errors.append(f"Group size must be -1, 32, 64, 128, or 256, got: {self.group_size}")
+        
+        # Check GPU availability if not offloading to CPU
+        if not self.offload_to_cpu and not torch.cuda.is_available():
+            errors.append("GPU not available but offload_to_cpu is False")
+        
+        # Check calibration settings
+        if self.calibration_samples < 1:
+            errors.append(f"Calibration samples must be >= 1, got: {self.calibration_samples}")
+        
+        if self.calibration_batch_size < 1:
+            errors.append(f"Calibration batch size must be >= 1, got: {self.calibration_batch_size}")
+        
+        if errors:
+            raise ConfigError("\n".join(errors))
+        
+        return True
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for serialization"""
-        # Convert all dataclass fields to dict
-        # Handle Path objects -> strings
-        # Include timestamp and version info
-        # Format for JSON/YAML serialization
-        pass
+        config_dict = asdict(self)
+        
+        # Convert Path objects to strings
+        config_dict['model_path'] = str(self.model_path)
+        config_dict['output_path'] = str(self.output_path)
+        config_dict['checkpoint_dir'] = str(self.checkpoint_dir)
+        
+        # Add metadata
+        config_dict['_metadata'] = {
+            'version': '1.0.0',
+            'model_type': 'GLM4.5',
+            'quantization_method': 'AWQ',
+            'timestamp': None  # Will be set when saving
+        }
+        
+        return config_dict
     
     @classmethod
     def from_yaml(cls, path: str) -> 'QuantizationConfig':
         """Load config from YAML file"""
-        # Read YAML file
-        # Handle missing fields with defaults
-        # Validate loaded config
-        # Return instantiated config object
-        pass
+        path = Path(path)
+        if not path.exists():
+            raise ConfigError(f"Config file not found: {path}")
+        
+        with open(path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        
+        # Remove metadata if present
+        config_dict.pop('_metadata', None)
+        
+        return cls(**config_dict)
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'QuantizationConfig':
         """Create config from dictionary"""
-        # Parse dictionary into dataclass fields
-        # Handle type conversions
-        # Apply defaults for missing fields
-        pass
+        # Remove metadata if present
+        config_dict = config_dict.copy()
+        config_dict.pop('_metadata', None)
+        
+        return cls(**config_dict)
     
     def save(self, path: str) -> None:
         """Save config to YAML file"""
-        # Convert to dict
-        # Write to YAML with comments
-        # Include metadata (timestamp, version)
-        pass
+        from datetime import datetime
+        
+        path = Path(path)
+        config_dict = self.to_dict()
+        
+        # Update timestamp
+        config_dict['_metadata']['timestamp'] = datetime.now().isoformat()
+        
+        # Create parent directory if needed
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(path, 'w') as f:
+            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
     
     def get_awq_config(self) -> Dict[str, Any]:
         """Get AWQ-specific configuration"""
-        # Extract AWQ-related settings
-        # Format for LLM Compressor AWQModifier
-        # Include GLM-specific adjustments
         return {
             "bits": self.bits,
             "group_size": self.group_size,
             "symmetric": self.symmetric,
             "damping_percent": self.awq_damping_percent,
-            "desc_act": self.awq_desc_act
+            "desc_act": self.awq_desc_act,
+            "true_sequential": self.awq_true_sequential,
+            "protection_factor": self.awq_protection_factor,
         }
 
 
@@ -113,59 +197,169 @@ class GLMModelConfig:
     num_attention_heads: int
     vocab_size: int
     num_experts: Optional[int] = None  # For MoE models
+    num_shared_experts: Optional[int] = None  # GLM4.5 has shared experts
     intermediate_size: Optional[int] = None
-    max_position_embeddings: int = 32768
+    max_position_embeddings: int = 131072  # GLM4.5 default
     layer_names: List[str] = field(default_factory=list)
     dtype: str = "float16"
+    rope_theta: float = 10000.0
+    partial_rotary_factor: float = 0.5  # GLM4.5 uses partial RoPE
     
     @classmethod
     def from_model_config(cls, model_path: str) -> 'GLMModelConfig':
         """Extract config from model files"""
-        # Load config.json from model directory
-        # Parse GLM-specific fields
-        # Handle both ChatGLM and GLM4 formats
-        # Extract layer structure information
-        # Identify MoE configuration if present
-        pass
+        model_path = Path(model_path)
+        config_path = model_path / "config.json"
+        
+        if not config_path.exists():
+            raise ConfigError(f"Model config not found: {config_path}")
+        
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Extract GLM4.5-specific fields
+        num_layers = config.get('num_hidden_layers', config.get('num_layers'))
+        hidden_size = config.get('hidden_size')
+        num_attention_heads = config.get('num_attention_heads')
+        vocab_size = config.get('vocab_size', config.get('padded_vocab_size'))
+        
+        # MoE configuration for GLM4.5
+        num_experts = config.get('num_experts', None)
+        num_shared_experts = config.get('num_shared_experts', None)
+        
+        # Intermediate size (FFN)
+        intermediate_size = config.get('intermediate_size', config.get('ffn_hidden_size'))
+        
+        # Other parameters
+        max_position_embeddings = config.get('max_position_embeddings', 131072)
+        rope_theta = config.get('rope_theta', 10000.0)
+        partial_rotary_factor = config.get('partial_rotary_factor', 0.5)
+        
+        # Generate layer names
+        layer_names = []
+        layer_names.append("transformer.embedding")
+        for i in range(num_layers):
+            layer_names.append(f"transformer.layers.{i}")
+        layer_names.append("transformer.final_layernorm")
+        layer_names.append("lm_head")
+        
+        return cls(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            num_experts=num_experts,
+            num_shared_experts=num_shared_experts,
+            intermediate_size=intermediate_size,
+            max_position_embeddings=max_position_embeddings,
+            layer_names=layer_names,
+            rope_theta=rope_theta,
+            partial_rotary_factor=partial_rotary_factor,
+        )
     
     def get_layer_memory_estimate(self, layer_idx: int) -> float:
         """Estimate memory requirement for a specific layer in GB"""
-        # Calculate based on layer type (attention vs MLP vs MoE)
-        # Account for:
-        #   - QKV projections: 3 * hidden_size * hidden_size
-        #   - Output projection: hidden_size * hidden_size
-        #   - MLP: 2 * hidden_size * intermediate_size
-        #   - Layer norms: negligible
-        #   - MoE: num_experts * mlp_size (if applicable)
-        # Return size in GB for FP16
-        pass
+        bytes_per_param = 2 if self.dtype == "float16" else 4
+        
+        if layer_idx == -1:  # Embedding layer
+            params = self.vocab_size * self.hidden_size
+        elif layer_idx == self.num_layers:  # Output head
+            params = self.vocab_size * self.hidden_size
+        else:  # Transformer layer
+            # Attention: Q, K, V, O projections
+            attention_params = 4 * self.hidden_size * self.hidden_size
+            
+            # MLP or MoE
+            if self.num_experts is not None:
+                # MoE layer: router + experts
+                router_params = self.hidden_size * self.num_experts
+                expert_params = self.num_experts * 2 * self.hidden_size * self.intermediate_size
+                if self.num_shared_experts:
+                    expert_params += self.num_shared_experts * 2 * self.hidden_size * self.intermediate_size
+                mlp_params = router_params + expert_params
+            else:
+                # Standard MLP: gate, up, down projections
+                mlp_params = 3 * self.hidden_size * self.intermediate_size
+            
+            # Layer norms (negligible but included)
+            norm_params = 2 * self.hidden_size
+            
+            params = attention_params + mlp_params + norm_params
+        
+        return (params * bytes_per_param) / 1e9
     
     def get_total_params(self) -> int:
         """Calculate total number of parameters"""
-        # Sum all layer parameters
-        # Include embeddings and output head
-        # Account for MoE if present
-        pass
+        total = 0
+        
+        # Embeddings
+        total += self.vocab_size * self.hidden_size
+        
+        # Transformer layers
+        for i in range(self.num_layers):
+            # Attention
+            total += 4 * self.hidden_size * self.hidden_size
+            
+            # MLP/MoE
+            if self.num_experts is not None:
+                total += self.hidden_size * self.num_experts  # Router
+                total += self.num_experts * 2 * self.hidden_size * self.intermediate_size
+                if self.num_shared_experts:
+                    total += self.num_shared_experts * 2 * self.hidden_size * self.intermediate_size
+            else:
+                total += 3 * self.hidden_size * self.intermediate_size
+            
+            # Layer norms
+            total += 2 * self.hidden_size
+        
+        # Final layer norm
+        total += self.hidden_size
+        
+        # Output head
+        total += self.vocab_size * self.hidden_size
+        
+        return total
     
     def get_layer_pattern(self, layer_idx: int) -> str:
         """Get naming pattern for layer at index"""
-        # Return GLM-specific layer naming
-        # e.g., "transformer.layers.{idx}"
-        # Handle special layers (embeddings, ln_f, lm_head)
-        pass
+        if layer_idx == -1:
+            return "transformer.embedding"
+        elif layer_idx == self.num_layers:
+            return "lm_head"
+        elif layer_idx == self.num_layers - 1:
+            return "transformer.final_layernorm"
+        else:
+            return f"transformer.layers.{layer_idx}"
     
     def estimate_quantized_size(self, bits: int = 4) -> float:
         """Estimate final model size after quantization in GB"""
-        # Calculate compressed size
-        # Account for layers that won't be quantized
-        # Add overhead for metadata and scales
-        pass
+        total_params = self.get_total_params()
+        
+        # Quantized layers (most weights)
+        quantized_params = total_params * 0.9  # Assume 90% of weights are quantized
+        quantized_size = (quantized_params * bits / 8) / 1e9
+        
+        # Non-quantized layers (embeddings, norms, etc.)
+        unquantized_params = total_params * 0.1
+        unquantized_size = (unquantized_params * 2) / 1e9  # FP16
+        
+        # Scales and metadata overhead (approximately 3% for group_size=128)
+        overhead = quantized_size * 0.03
+        
+        return quantized_size + unquantized_size + overhead
     
     def get_moe_config(self) -> Optional[Dict[str, Any]]:
         """Get MoE-specific configuration if applicable"""
-        # Return None if not MoE model
-        # Otherwise return expert configuration
-        pass
+        if self.num_experts is None:
+            return None
+        
+        return {
+            "num_experts": self.num_experts,
+            "num_shared_experts": self.num_shared_experts,
+            "expert_intermediate_size": self.intermediate_size,
+            "router_type": "sigmoid",  # GLM4.5 uses sigmoid gates
+            "top_k": 8,  # GLM4.5 typically uses top-8 routing
+        }
 
 
 @dataclass
@@ -177,12 +371,11 @@ class AWQLayerConfig:
     output_layers: List[str]  # Layers that receive output
     quantize: bool = True
     bits: int = 4
-    group_size: int = 32
+    group_size: int = 128
     
     def to_mapping(self) -> List[str]:
         """Convert to LLM Compressor mapping format"""
-        # Format as ["input_pattern", ["output_pattern1", "output_pattern2"]]
-        pass
+        return [self.input_layer, self.output_layers]
 
 
 class ConfigError(Exception):
@@ -193,25 +386,75 @@ class ConfigError(Exception):
 def create_default_config(model_path: str, output_path: str) -> QuantizationConfig:
     """Create a default configuration for GLM model"""
     # Detect model size from path or config
-    # Set appropriate memory limits
-    # Configure optimal settings for detected hardware
-    # Return configured QuantizationConfig
-    pass
+    model_config = GLMModelConfig.from_model_config(model_path)
+    
+    # Set appropriate memory limits based on model size
+    estimated_size = model_config.estimate_quantized_size(bits=4)
+    
+    # Determine if CPU offloading is needed
+    gpu_available = torch.cuda.is_available()
+    if gpu_available:
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+        offload_needed = estimated_size > gpu_mem * 0.8
+    else:
+        offload_needed = True
+    
+    # Create config
+    config = QuantizationConfig(
+        model_path=model_path,
+        output_path=output_path,
+        checkpoint_dir=Path(output_path).parent / "checkpoints",
+        offload_to_cpu=offload_needed,
+    )
+    
+    # Adjust batch size based on model size
+    if model_config.num_layers > 50:  # Large model
+        config.calibration_batch_size = 1
+    elif model_config.num_layers > 30:  # Medium model
+        config.calibration_batch_size = 2
+    else:  # Small model
+        config.calibration_batch_size = 4
+    
+    return config
 
 
 def get_glm_layer_mappings() -> List[AWQLayerConfig]:
     """Get standard AWQ layer mappings for GLM architecture"""
-    # Define GLM-specific layer connections:
-    # - input_layernorm -> q/k/v projections
-    # - v_proj -> o_proj
-    # - post_attention_layernorm -> gate/up projections
-    # - up_proj -> down_proj
-    # Return list of AWQLayerConfig objects
+    # GLM4.5-specific layer connections for AWQ scale propagation
     return [
+        # Attention input scaling
         AWQLayerConfig(
             layer_name="input_layernorm",
-            input_layer="input_layernorm",
-            output_layers=["q_proj", "k_proj", "v_proj"]
+            input_layer="re:.*input_layernorm",
+            output_layers=["re:.*q_proj", "re:.*k_proj", "re:.*v_proj"]
         ),
-        # ... more mappings
+        # Attention output scaling
+        AWQLayerConfig(
+            layer_name="v_proj",
+            input_layer="re:.*v_proj",
+            output_layers=["re:.*o_proj"]
+        ),
+        # MLP input scaling
+        AWQLayerConfig(
+            layer_name="post_attention_layernorm",
+            input_layer="re:.*post_attention_layernorm",
+            output_layers=["re:.*gate_proj", "re:.*up_proj"]
+        ),
+        # MLP output scaling
+        AWQLayerConfig(
+            layer_name="up_proj",
+            input_layer="re:.*up_proj",
+            output_layers=["re:.*down_proj"]
+        ),
+        # MoE expert scaling (if applicable)
+        AWQLayerConfig(
+            layer_name="expert_gate",
+            input_layer="re:.*expert.*gate",
+            output_layers=["re:.*expert.*up"]
+        ),
+        AWQLayerConfig(
+            layer_name="expert_up",
+            input_layer="re:.*expert.*up",
+            output_layers=["re:.*expert.*down"]
+        ),
     ]
