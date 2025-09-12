@@ -10,8 +10,6 @@ from dataclasses import dataclass, field
 from collections import deque
 import warnings
 import time
-import threading
-from queue import Queue
 
 
 @dataclass
@@ -58,10 +56,6 @@ class MemoryManager:
         self.gpu_device = torch.device("cuda:0") if torch.cuda.is_available() else None
         self.enable_aggressive_cleanup = True
         self.min_free_memory = 2.0  # Always keep 2GB free
-        
-        # Prefetch queue for next layer
-        self.prefetch_queue = Queue(maxsize=1)
-        self.prefetch_thread = None
         
         # Initialize CUDA if available
         if torch.cuda.is_available():
@@ -110,20 +104,8 @@ class MemoryManager:
         # Clear cache
         torch.cuda.empty_cache()
         
-        # Garbage collection
+        # Single garbage collection
         gc.collect()
-        
-        if self.enable_aggressive_cleanup:
-            # Reset peak memory statistics
-            torch.cuda.reset_peak_memory_stats()
-            
-            # Additional aggressive cleanup
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            
-            # Multiple GC passes
-            for _ in range(3):
-                gc.collect()
         
         after_stats = self.get_current_memory()
         freed = before_stats.gpu_used - after_stats.gpu_used
@@ -315,22 +297,12 @@ class MemoryManager:
         # Clear all caches
         self.clear_gpu_cache()
         
-        # Offload non-essential tensors to CPU
-        tensors_to_offload = []
-        for name, tracker in self.tensor_registry.items():
-            if tracker.device != "cpu" and "essential" not in name:
-                tensors_to_offload.append(name)
-        
-        for name in tensors_to_offload:
-            self.logger.info(f"Emergency offloading tensor: {name}")
-            # Note: Actual tensor offloading would need tensor reference
-        
-        # Multiple aggressive GC passes
-        for _ in range(5):
-            gc.collect()
+        # Single aggressive GC pass
+        gc.collect()
         
         # Clear Python's internal caches
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Log final state
         self.monitor_memory("after_emergency_cleanup")
@@ -527,34 +499,6 @@ class MemoryManager:
         }
         
         return result, memory_profile
-    
-    def start_prefetch(self, load_func, *args, **kwargs) -> None:
-        """Start prefetching next layer in background"""
-        def prefetch_worker():
-            try:
-                result = load_func(*args, **kwargs)
-                self.prefetch_queue.put(("success", result))
-            except Exception as e:
-                self.prefetch_queue.put(("error", e))
-        
-        self.prefetch_thread = threading.Thread(target=prefetch_worker)
-        self.prefetch_thread.start()
-    
-    def get_prefetched(self, timeout: float = None):
-        """Get prefetched result"""
-        if self.prefetch_thread is None:
-            return None
-        
-        # Wait for prefetch to complete
-        self.prefetch_thread.join(timeout=timeout)
-        
-        if not self.prefetch_queue.empty():
-            status, result = self.prefetch_queue.get()
-            if status == "error":
-                raise result
-            return result
-        
-        return None
     
     @property
     def is_gpu_available(self) -> bool:

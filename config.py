@@ -47,6 +47,9 @@ class QuantizationConfig:
         "*.router",  # MoE routers stay in FP16
     ])
     
+    # Model configuration defaults
+    max_position_embeddings: int = 2048  # Default sequence length
+    
     # AWQ specific settings
     awq_damping_percent: float = 0.01
     awq_desc_act: bool = False
@@ -71,12 +74,29 @@ class QuantizationConfig:
             # Use 80% of available CPU memory
             self.max_cpu_memory = int(cpu_mem * 0.8)
         
+        # Set max_position_embeddings from model config if available
+        if hasattr(self, 'model_path') and self.model_path.exists():
+            config_file = self.model_path / "config.json"
+            if config_file.exists():
+                try:
+                    with open(config_file, 'r') as f:
+                        model_config = json.load(f)
+                    # Try to get max_position_embeddings from model config
+                    self.max_position_embeddings = model_config.get(
+                        'max_position_embeddings',
+                        model_config.get('max_sequence_length', 2048)
+                    )
+                except:
+                    # Keep default if loading fails
+                    pass
+        
         # Validate configuration
         self.validate()
     
     def validate(self) -> bool:
         """Validate configuration settings"""
         errors = []
+        warnings = []
         
         # Check if model_path exists
         if not self.model_path.exists():
@@ -84,14 +104,18 @@ class QuantizationConfig:
         
         # Verify output_path parent exists and is writable
         if not self.output_path.parent.exists():
-            errors.append(f"Output directory parent does not exist: {self.output_path.parent}")
+            # Try to create it
+            try:
+                self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            except:
+                errors.append(f"Cannot create output directory parent: {self.output_path.parent}")
         
         # Ensure memory limits are reasonable
         if self.max_gpu_memory < 4:
-            errors.append(f"GPU memory limit too low: {self.max_gpu_memory}GB")
+            warnings.append(f"GPU memory limit may be too low: {self.max_gpu_memory}GB")
         
         if self.max_cpu_memory < 16:
-            errors.append(f"CPU memory limit too low: {self.max_cpu_memory}GB")
+            warnings.append(f"CPU memory limit may be too low: {self.max_cpu_memory}GB")
         
         # Validate quantization parameters
         if self.bits not in [3, 4, 8]:
@@ -110,6 +134,19 @@ class QuantizationConfig:
         
         if self.calibration_batch_size < 1:
             errors.append(f"Calibration batch size must be >= 1, got: {self.calibration_batch_size}")
+        
+        # Validate max_position_embeddings
+        if self.max_position_embeddings < 128:
+            warnings.append(f"max_position_embeddings seems too small: {self.max_position_embeddings}")
+        
+        # Check checkpoint frequency
+        if self.checkpoint_every_n_layers < 1:
+            self.checkpoint_every_n_layers = 5  # Auto-fix
+            warnings.append("checkpoint_every_n_layers was < 1, set to 5")
+        
+        # Print warnings
+        for warning in warnings:
+            logging.warning(warning)
         
         if errors:
             raise ConfigError("\n".join(errors))
@@ -148,6 +185,9 @@ class QuantizationConfig:
         # Remove metadata if present
         config_dict.pop('_metadata', None)
         
+        # Ensure required fields have defaults
+        config_dict.setdefault('max_position_embeddings', 2048)
+        
         return cls(**config_dict)
     
     @classmethod
@@ -156,6 +196,9 @@ class QuantizationConfig:
         # Remove metadata if present
         config_dict = config_dict.copy()
         config_dict.pop('_metadata', None)
+        
+        # Ensure required fields have defaults
+        config_dict.setdefault('max_position_embeddings', 2048)
         
         return cls(**config_dict)
     

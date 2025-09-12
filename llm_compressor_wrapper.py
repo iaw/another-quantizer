@@ -4,11 +4,13 @@
 from typing import Dict, Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dataclasses import dataclass
 from pathlib import Path
 import logging
 import numpy as np
 import gc
+import re  # FIXED: Added missing import
 
 # LLM Compressor imports
 try:
@@ -126,6 +128,11 @@ class LLMCompressorWrapper:
         ]
         
         return mappings
+    
+    def _create_glm_mappings(self) -> List[GLMLayerMapping]:
+        """Create GLM layer mappings (internal)"""
+        # Return empty list as this is just internal bookkeeping
+        return []
     
     def quantize_layer_with_awq(self,
                                layer: torch.nn.Module,

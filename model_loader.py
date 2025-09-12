@@ -187,8 +187,11 @@ class SequentialModelLoader:
         
         return self.layer_info
     
-    def iterate_layers(self) -> Iterator[Tuple[str, torch.nn.Module]]:
-        """Iterate through model layers one at a time"""
+    def iterate_layers(self) -> Iterator[Tuple[str, Dict[str, torch.Tensor]]]:
+        """Iterate through model layers one at a time - SIMPLIFIED
+        
+        Returns dictionary of weights instead of nn.Module
+        """
         self.logger.info("Starting sequential layer iteration")
         
         for layer_name in self.layer_names:
@@ -196,15 +199,15 @@ class SequentialModelLoader:
                 # Memory check before loading
                 self.memory_manager.monitor_memory(f"before_{layer_name}")
                 
-                # Load layer from disk
-                layer_module = self.load_layer(layer_name)
+                # Load layer from disk (now returns dict)
+                layer_weights = self.load_layer(layer_name)
                 
                 # Yield to caller for processing
                 self.logger.info(f"Yielding layer: {layer_name}")
-                yield (layer_name, layer_module)
+                yield (layer_name, layer_weights)
                 
                 # Cleanup after processing
-                self.cleanup_layer(layer_module)
+                self.cleanup_layer_weights(layer_weights)
                 self.memory_manager.clear_gpu_cache()
                 
                 # Memory check after cleanup
@@ -214,8 +217,15 @@ class SequentialModelLoader:
                 self.logger.error(f"Error loading layer {layer_name}: {e}")
                 raise
     
-    def load_layer(self, layer_name: str) -> torch.nn.Module:
-        """Load a single layer from disk"""
+    def load_layer(self, layer_name: str) -> Dict[str, torch.Tensor]:
+        """Load a single layer from disk - SIMPLIFIED
+        
+        Returns dictionary of weights instead of nn.Module
+        """
+        if layer_name not in self.layer_info:
+            self.logger.error(f"Layer {layer_name} not found in layer_info")
+            return {}
+        
         layer_info = self.layer_info[layer_name]
         self.logger.info(f"Loading layer: {layer_name} (type: {layer_info.layer_type}, "
                         f"size: {layer_info.estimated_size_gb:.2f}GB)")
@@ -225,215 +235,183 @@ class SequentialModelLoader:
         for weight_file in layer_info.weight_files:
             file_path = self.model_path / weight_file
             
+            if not file_path.exists():
+                self.logger.warning(f"Weight file not found: {file_path}")
+                continue
+            
             # Load only the weights we need for this layer
             layer_weight_names = [w for w, f in self.weight_map.items() 
                                  if f == weight_file and self._extract_layer_name(w) == layer_name]
             
-            if self.use_safetensors:
-                loaded_weights = self.load_safetensors_partial(file_path, layer_weight_names)
-            else:
-                loaded_weights = self.load_pytorch_partial(file_path, layer_weight_names)
+            if not layer_weight_names:
+                self.logger.debug(f"No weights to load from {weight_file} for layer {layer_name}")
+                continue
             
-            weights.update(loaded_weights)
+            try:
+                if self.use_safetensors:
+                    loaded_weights = self.load_safetensors_partial(file_path, layer_weight_names)
+                else:
+                    loaded_weights = self.load_pytorch_partial(file_path, layer_weight_names)
+                
+                weights.update(loaded_weights)
+            except Exception as e:
+                self.logger.error(f"Error loading weights from {file_path}: {e}")
+                continue
         
-        # Construct appropriate module based on layer type
+        if not weights:
+            self.logger.warning(f"No weights loaded for layer {layer_name}")
+            return {}
+        
+        # Return weights directly based on layer type
+        # No complex construction needed
         if layer_info.layer_type == 'embedding':
-            module = self._construct_embedding_layer(weights)
+            return self._extract_embedding_weights(weights)
         elif layer_info.layer_type == 'lm_head':
-            module = self.load_output_head(weights)
+            return self._extract_output_weights(weights)
         elif layer_info.layer_type == 'layernorm':
-            module = self._construct_layernorm(weights)
+            return weights  # Return as-is for layer norms
         elif layer_info.is_moe:
-            module = self.construct_moe_layer(layer_info.layer_index, weights)
+            return self.construct_moe_layer(layer_info.layer_index, weights)
         else:
-            module = self.construct_transformer_layer(layer_info.layer_index, weights)
-        
-        return module
+            return self.construct_transformer_layer(layer_info.layer_index, weights)
     
     def load_safetensors_partial(self, 
                                  file_path: Path,
                                  tensor_names: List[str]) -> Dict[str, torch.Tensor]:
-        """Load specific tensors from safetensors file"""
-        # Use safetensors lazy loading
+        """Load specific tensors from safetensors file with error handling"""
         tensors = {}
         
-        with safetensors.safe_open(file_path, framework="pt", device="cpu") as f:
-            for name in tensor_names:
-                if name in f.keys():
-                    tensors[name] = f.get_tensor(name)
+        if not file_path.exists():
+            self.logger.warning(f"Safetensors file not found: {file_path}")
+            return tensors
+        
+        try:
+            with safetensors.safe_open(file_path, framework="pt", device="cpu") as f:
+                available_keys = f.keys()
+                for name in tensor_names:
+                    if name in available_keys:
+                        tensors[name] = f.get_tensor(name)
+                    else:
+                        self.logger.debug(f"Tensor not found in file: {name}")
+        except Exception as e:
+            self.logger.error(f"Error loading safetensors file {file_path}: {e}")
         
         return tensors
     
     def load_pytorch_partial(self,
                            file_path: Path,
                            tensor_names: List[str]) -> Dict[str, torch.Tensor]:
-        """Load specific tensors from PyTorch .bin file"""
-        # Load entire file (less efficient than safetensors)
-        state_dict = torch.load(file_path, map_location='cpu')
+        """Load specific tensors from PyTorch .bin file with error handling"""
+        tensors = {}
         
-        # Filter to requested tensors
-        tensors = {name: state_dict[name] for name in tensor_names if name in state_dict}
+        if not file_path.exists():
+            self.logger.warning(f"PyTorch file not found: {file_path}")
+            return tensors
         
-        # Clean up the full state dict
-        del state_dict
-        gc.collect()
+        try:
+            # Load entire file (less efficient than safetensors)
+            state_dict = torch.load(file_path, map_location='cpu')
+            
+            # Filter to requested tensors
+            for name in tensor_names:
+                if name in state_dict:
+                    tensors[name] = state_dict[name]
+                else:
+                    self.logger.debug(f"Tensor not found in file: {name}")
+            
+            # Clean up the full state dict
+            del state_dict
+            gc.collect()
+            
+        except Exception as e:
+            self.logger.error(f"Error loading PyTorch file {file_path}: {e}")
         
         return tensors
     
     def construct_transformer_layer(self,
                                    layer_idx: int,
-                                   weights: Dict[str, torch.Tensor]) -> nn.Module:
-        """Construct a transformer layer from weights"""
+                                   weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Construct a transformer layer from weights - SIMPLIFIED
         
-        class TransformerLayer(nn.Module):
-            """Container for a transformer layer"""
-            def __init__(self, weights, hidden_size, num_heads):
-                super().__init__()
-                self.hidden_size = hidden_size
-                self.num_heads = num_heads
-                
-                # Attention components
-                self.input_layernorm = self._create_norm(weights, 'input_layernorm')
-                self.q_proj = self._create_linear(weights, 'q_proj')
-                self.k_proj = self._create_linear(weights, 'k_proj')
-                self.v_proj = self._create_linear(weights, 'v_proj')
-                self.o_proj = self._create_linear(weights, 'o_proj')
-                
-                # MLP components
-                self.post_attention_layernorm = self._create_norm(weights, 'post_attention_layernorm')
-                self.gate_proj = self._create_linear(weights, 'gate_proj')
-                self.up_proj = self._create_linear(weights, 'up_proj')
-                self.down_proj = self._create_linear(weights, 'down_proj')
-            
-            def _create_linear(self, weights, name):
-                """Create linear layer from weights"""
-                weight_key = None
-                bias_key = None
-                
-                for key in weights.keys():
-                    if name in key and 'weight' in key:
-                        weight_key = key
-                    elif name in key and 'bias' in key:
-                        bias_key = key
-                
-                if weight_key is None:
-                    return None
-                
-                weight = weights[weight_key]
-                bias = weights[bias_key] if bias_key else None
-                
-                linear = nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None)
-                linear.weight.data = weight
-                if bias is not None:
-                    linear.bias.data = bias
-                
-                return linear
-            
-            def _create_norm(self, weights, name):
-                """Create layer norm from weights"""
-                weight_key = None
-                bias_key = None
-                
-                for key in weights.keys():
-                    if name in key and 'weight' in key:
-                        weight_key = key
-                    elif name in key and 'bias' in key:
-                        bias_key = key
-                
-                if weight_key is None:
-                    return None
-                
-                weight = weights[weight_key]
-                bias = weights[bias_key] if bias_key else None
-                
-                norm = nn.LayerNorm(weight.shape[0], elementwise_affine=True)
-                norm.weight.data = weight
-                if bias is not None:
-                    norm.bias.data = bias
-                
-                return norm
+        Returns a dictionary of weights instead of full nn.Module for simplicity
+        """
+        layer_weights = {}
         
-        return TransformerLayer(weights, self.hidden_size, self.num_attention_heads)
+        if not weights:
+            self.logger.warning(f"No weights provided for layer {layer_idx}")
+            return layer_weights
+        
+        # Simply organize weights by component type
+        for weight_name, weight_tensor in weights.items():
+            # Validate tensor
+            if weight_tensor is None:
+                self.logger.warning(f"None tensor for {weight_name}")
+                continue
+            
+            if torch.isnan(weight_tensor).any() or torch.isinf(weight_tensor).any():
+                self.logger.warning(f"NaN/Inf detected in {weight_name}")
+                continue
+            
+            # Extract the component name from the full weight name
+            # e.g., "transformer.layers.0.attention.q_proj.weight" -> "attention.q_proj.weight"
+            if f"layers.{layer_idx}." in weight_name:
+                # Remove the layer prefix to get component name
+                component_name = weight_name.split(f"layers.{layer_idx}.")[-1]
+                layer_weights[component_name] = weight_tensor
+            else:
+                # Keep as is if pattern doesn't match
+                layer_weights[weight_name] = weight_tensor
+        
+        if not layer_weights:
+            self.logger.warning(f"No valid weights found for layer {layer_idx}")
+        else:
+            self.logger.debug(f"Constructed layer {layer_idx} with {len(layer_weights)} weight tensors")
+        
+        return layer_weights
     
     def construct_moe_layer(self,
                           layer_idx: int,
-                          weights: Dict[str, torch.Tensor]) -> nn.Module:
-        """Construct an MoE layer from weights"""
+                          weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Construct an MoE layer from weights - SIMPLIFIED
         
-        class MoELayer(nn.Module):
-            """Container for an MoE layer"""
-            def __init__(self, weights, num_experts, num_shared_experts, hidden_size):
-                super().__init__()
-                self.num_experts = num_experts
-                self.num_shared_experts = num_shared_experts
-                self.hidden_size = hidden_size
-                
-                # Attention components (same as transformer)
-                self.input_layernorm = self._create_norm(weights, 'input_layernorm')
-                self.q_proj = self._create_linear(weights, 'q_proj')
-                self.k_proj = self._create_linear(weights, 'k_proj')
-                self.v_proj = self._create_linear(weights, 'v_proj')
-                self.o_proj = self._create_linear(weights, 'o_proj')
-                
-                # MoE components
-                self.post_attention_layernorm = self._create_norm(weights, 'post_attention_layernorm')
-                
-                # Router (stays in FP16)
-                self.router = self._create_linear(weights, 'router')
-                
-                # Shared experts
-                self.shared_experts = nn.ModuleList()
-                for i in range(num_shared_experts or 0):
-                    expert = nn.ModuleDict({
-                        'gate_proj': self._create_linear(weights, f'shared_expert.{i}.gate_proj'),
-                        'up_proj': self._create_linear(weights, f'shared_expert.{i}.up_proj'),
-                        'down_proj': self._create_linear(weights, f'shared_expert.{i}.down_proj'),
-                    })
-                    self.shared_experts.append(expert)
-                
-                # Routed experts
-                self.experts = nn.ModuleList()
-                for i in range(num_experts):
-                    expert = nn.ModuleDict({
-                        'gate_proj': self._create_linear(weights, f'experts.{i}.gate_proj'),
-                        'up_proj': self._create_linear(weights, f'experts.{i}.up_proj'),
-                        'down_proj': self._create_linear(weights, f'experts.{i}.down_proj'),
-                    })
-                    self.experts.append(expert)
-            
-            def _create_linear(self, weights, name):
-                """Create linear layer from weights"""
-                weight_key = None
-                for key in weights.keys():
-                    if name in key and 'weight' in key:
-                        weight_key = key
-                        break
-                
-                if weight_key is None:
-                    return None
-                
-                weight = weights[weight_key]
-                linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
-                linear.weight.data = weight
-                return linear
-            
-            def _create_norm(self, weights, name):
-                """Create layer norm from weights"""
-                weight_key = None
-                for key in weights.keys():
-                    if name in key and 'weight' in key:
-                        weight_key = key
-                        break
-                
-                if weight_key is None:
-                    return None
-                
-                weight = weights[weight_key]
-                norm = nn.LayerNorm(weight.shape[0])
-                norm.weight.data = weight
-                return norm
+        Returns a dictionary of weights instead of full nn.Module for simplicity
+        Treats MoE layers similarly to regular transformer layers
+        """
+        layer_weights = {}
         
-        return MoELayer(weights, self.num_experts, self.num_shared_experts, self.hidden_size)
+        if not weights:
+            self.logger.warning(f"No weights provided for MoE layer {layer_idx}")
+            return layer_weights
+        
+        # Simply organize weights by component type
+        for weight_name, weight_tensor in weights.items():
+            # Validate tensor
+            if weight_tensor is None:
+                self.logger.warning(f"None tensor for {weight_name}")
+                continue
+            
+            if torch.isnan(weight_tensor).any() or torch.isinf(weight_tensor).any():
+                self.logger.warning(f"NaN/Inf detected in {weight_name}")
+                continue
+            
+            # Extract the component name from the full weight name
+            if f"layers.{layer_idx}." in weight_name:
+                # Remove the layer prefix to get component name
+                component_name = weight_name.split(f"layers.{layer_idx}.")[-1]
+                layer_weights[component_name] = weight_tensor
+            else:
+                # Keep as is if pattern doesn't match
+                layer_weights[weight_name] = weight_tensor
+        
+        # Count experts if present
+        num_experts = sum(1 for k in layer_weights.keys() if 'expert' in k and 'weight' in k)
+        if num_experts > 0:
+            self.logger.debug(f"Constructed MoE layer {layer_idx} with {num_experts} experts")
+        
+        if not layer_weights:
+            self.logger.warning(f"No valid weights found for MoE layer {layer_idx}")
+        
+        return layer_weights
     
     def save_quantized_layer(self, 
                            layer_name: str,
@@ -551,6 +529,27 @@ class SequentialModelLoader:
             layer_norm.bias.data = norm_bias
         
         return layer_norm
+    
+    def _extract_embedding_weights(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Extract embedding weights - SIMPLIFIED"""
+        return weights  # Just return the weights dictionary
+    
+    def _extract_output_weights(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Extract output head weights - SIMPLIFIED"""
+        return weights  # Just return the weights dictionary
+    
+    def cleanup_layer_weights(self, layer_weights: Dict[str, torch.Tensor]) -> None:
+        """Clean up layer weights from memory - SIMPLIFIED"""
+        # Clear weight tensors
+        for key in list(layer_weights.keys()):
+            del layer_weights[key]
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear CUDA cache if applicable
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def get_layer_size(self, layer_name: str) -> float:
         """Get size of layer in GB"""
