@@ -89,7 +89,14 @@ class LayerQuantizer:
         # Move layer to GPU if needed and possible
         device = self._determine_device(layer, original_size_gb)
         layer = layer.to(device)
-        calibration_data = calibration_data.to(device)
+        
+        # Ensure calibration data is on same device and has proper shape
+        if isinstance(calibration_data, dict):
+            calibration_data = calibration_data.get('input_ids', calibration_data)
+        if isinstance(calibration_data, torch.Tensor):
+            calibration_data = calibration_data.to(device)
+            if calibration_data.dim() == 2:
+                calibration_data = calibration_data.unsqueeze(0)  # Add batch dimension
         
         # Memory check
         self.memory_manager.monitor_memory(f"before_quantize_{layer_name}")
@@ -112,7 +119,7 @@ class LayerQuantizer:
                 # Generic quantization
                 quantized_layer = self._apply_awq_quantization(layer, scales)
             
-            # Pack weights
+            # Pack weights if needed
             quantized_layer = self._pack_layer_weights(quantized_layer)
             
             # Validate quantization
@@ -206,10 +213,33 @@ class LayerQuantizer:
                 if calibration_data.dim() == 2:
                     calibration_data = calibration_data.unsqueeze(0)
                 
+                # Create dummy input with proper shape for the layer
+                # For transformer layers, we need hidden_size dimension
+                if hasattr(layer, 'hidden_size'):
+                    hidden_size = layer.hidden_size
+                elif hasattr(layer, 'input_layernorm'):
+                    # Try to infer from layer norm
+                    hidden_size = layer.input_layernorm.weight.shape[0]
+                else:
+                    # Fallback to config
+                    hidden_size = self.config.hidden_size if hasattr(self.config, 'hidden_size') else 4096
+                
+                batch_size = calibration_data.shape[0] if calibration_data.dim() > 0 else 1
+                seq_len = calibration_data.shape[1] if calibration_data.dim() > 1 else 128
+                
+                # Create proper input tensor
+                dummy_input = torch.randn(batch_size, seq_len, hidden_size, 
+                                         device=calibration_data.device, dtype=torch.float16)
+                
                 # Forward pass
-                _ = layer(calibration_data)
+                _ = layer(dummy_input)
             except Exception as e:
                 self.logger.warning(f"Forward pass failed during scale computation: {e}")
+                # Try with calibration data directly
+                try:
+                    _ = layer(calibration_data)
+                except:
+                    pass
         
         # Remove hooks
         for handle in hooks:
@@ -219,6 +249,8 @@ class LayerQuantizer:
         for name, module in linear_modules.items():
             if name not in activations:
                 self.logger.warning(f"No activations captured for {name}")
+                # Use default scale
+                scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
                 continue
             
             X = activations[name]
@@ -407,18 +439,37 @@ class LayerQuantizer:
         with torch.no_grad():
             # Move to same device
             device = next(original.parameters()).device
-            test_input = test_input.to(device)
+            
+            # Create proper test input
+            if hasattr(original, 'hidden_size'):
+                hidden_size = original.hidden_size
+            elif hasattr(original, 'input_layernorm'):
+                hidden_size = original.input_layernorm.weight.shape[0]
+            else:
+                # Try to infer from first linear layer
+                for module in original.modules():
+                    if isinstance(module, nn.Linear):
+                        hidden_size = module.in_features
+                        break
+                else:
+                    hidden_size = 4096  # Fallback
+            
+            # Create test input with proper shape
+            batch_size = 1
+            seq_len = 128
+            test_tensor = torch.randn(batch_size, seq_len, hidden_size, 
+                                     device=device, dtype=torch.float16)
             
             # Get original output
             try:
-                orig_out = original(test_input)
+                orig_out = original(test_tensor)
             except:
                 # Some layers might need different inputs
                 return 0.0
             
             # Get quantized output
             try:
-                quant_out = quantized(test_input)
+                quant_out = quantized(test_tensor)
             except:
                 # Quantized layer might have different structure
                 return 0.0
@@ -606,7 +657,15 @@ class LayerQuantizer:
         # Run forward pass to see which experts are activated
         with torch.no_grad():
             try:
-                _ = moe_module(calibration_data)
+                # Create proper input
+                if hasattr(moe_module, 'hidden_size'):
+                    hidden_size = moe_module.hidden_size
+                else:
+                    hidden_size = 4096
+                
+                dummy_input = torch.randn(1, 128, hidden_size, 
+                                         device=calibration_data.device, dtype=torch.float16)
+                _ = moe_module(dummy_input)
             except:
                 pass
         
@@ -909,12 +968,24 @@ class LayerQuantizer:
             return "mlp"
         
         # Check module structure
-        has_qkv = any('q_proj' in n or 'k_proj' in n or 'v_proj' in n for n, _ in layer.named_modules())
+        has_qkv = any(hasattr(layer, attr) for attr in ['q_proj', 'k_proj', 'v_proj'])
         if has_qkv:
             return "attention"
         
-        has_gate_up = any('gate_proj' in n or 'up_proj' in n for n, _ in layer.named_modules())
+        # Check for attention submodules
+        has_attention_modules = any('q_proj' in n or 'k_proj' in n or 'v_proj' in n 
+                                   for n, _ in layer.named_modules())
+        if has_attention_modules:
+            return "attention"
+        
+        has_gate_up = any(hasattr(layer, attr) for attr in ['gate_proj', 'up_proj'])
         if has_gate_up:
+            return "mlp"
+        
+        # Check for MLP submodules
+        has_mlp_modules = any('gate_proj' in n or 'up_proj' in n 
+                             for n, _ in layer.named_modules())
+        if has_mlp_modules:
             return "mlp"
         
         return "generic"

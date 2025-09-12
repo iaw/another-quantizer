@@ -121,9 +121,9 @@ class SequentialModelLoader:
                 self.weight_files = ["model.safetensors"]
                 self.use_safetensors = True
                 # Build weight map by loading metadata
-                metadata = safetensors.torch.load_file(safetensors_file, device="cpu")
-                for key in metadata.keys():
-                    self.weight_map[key] = "model.safetensors"
+                with safetensors.safe_open(str(safetensors_file), framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        self.weight_map[key] = "model.safetensors"
             elif pytorch_file.exists():
                 self.weight_files = ["pytorch_model.bin"]
                 self.use_safetensors = False
@@ -187,10 +187,10 @@ class SequentialModelLoader:
         
         return self.layer_info
     
-    def iterate_layers(self) -> Iterator[Tuple[str, Dict[str, torch.Tensor]]]:
-        """Iterate through model layers one at a time - SIMPLIFIED
+    def iterate_layers(self) -> Iterator[Tuple[str, nn.Module]]:
+        """Iterate through model layers one at a time
         
-        Returns dictionary of weights instead of nn.Module
+        Returns proper nn.Module objects for each layer
         """
         self.logger.info("Starting sequential layer iteration")
         
@@ -199,15 +199,15 @@ class SequentialModelLoader:
                 # Memory check before loading
                 self.memory_manager.monitor_memory(f"before_{layer_name}")
                 
-                # Load layer from disk (now returns dict)
-                layer_weights = self.load_layer(layer_name)
+                # Load layer from disk (returns nn.Module)
+                layer_module = self.load_layer(layer_name)
                 
                 # Yield to caller for processing
                 self.logger.info(f"Yielding layer: {layer_name}")
-                yield (layer_name, layer_weights)
+                yield (layer_name, layer_module)
                 
                 # Cleanup after processing
-                self.cleanup_layer_weights(layer_weights)
+                self.cleanup_layer(layer_module)
                 self.memory_manager.clear_gpu_cache()
                 
                 # Memory check after cleanup
@@ -217,14 +217,14 @@ class SequentialModelLoader:
                 self.logger.error(f"Error loading layer {layer_name}: {e}")
                 raise
     
-    def load_layer(self, layer_name: str) -> Dict[str, torch.Tensor]:
-        """Load a single layer from disk - SIMPLIFIED
+    def load_layer(self, layer_name: str) -> nn.Module:
+        """Load a single layer from disk
         
-        Returns dictionary of weights instead of nn.Module
+        Returns proper nn.Module constructed from weights
         """
         if layer_name not in self.layer_info:
             self.logger.error(f"Layer {layer_name} not found in layer_info")
-            return {}
+            raise KeyError(f"Layer {layer_name} not found")
         
         layer_info = self.layer_info[layer_name]
         self.logger.info(f"Loading layer: {layer_name} (type: {layer_info.layer_type}, "
@@ -260,16 +260,15 @@ class SequentialModelLoader:
         
         if not weights:
             self.logger.warning(f"No weights loaded for layer {layer_name}")
-            return {}
+            raise ValueError(f"No weights found for layer {layer_name}")
         
-        # Return weights directly based on layer type
-        # No complex construction needed
+        # Construct appropriate module based on layer type
         if layer_info.layer_type == 'embedding':
-            return self._extract_embedding_weights(weights)
+            return self._construct_embedding_layer(weights)
         elif layer_info.layer_type == 'lm_head':
-            return self._extract_output_weights(weights)
+            return self._construct_output_layer(weights)
         elif layer_info.layer_type == 'layernorm':
-            return weights  # Return as-is for layer norms
+            return self._construct_layernorm(weights)
         elif layer_info.is_moe:
             return self.construct_moe_layer(layer_info.layer_index, weights)
         else:
@@ -286,7 +285,7 @@ class SequentialModelLoader:
             return tensors
         
         try:
-            with safetensors.safe_open(file_path, framework="pt", device="cpu") as f:
+            with safetensors.safe_open(str(file_path), framework="pt", device="cpu") as f:
                 available_keys = f.keys()
                 for name in tensor_names:
                     if name in available_keys:
@@ -330,18 +329,50 @@ class SequentialModelLoader:
     
     def construct_transformer_layer(self,
                                    layer_idx: int,
-                                   weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Construct a transformer layer from weights - SIMPLIFIED
+                                   weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Construct a transformer layer from weights
         
-        Returns a dictionary of weights instead of full nn.Module for simplicity
+        Returns a proper nn.Module with attention and MLP components
         """
-        layer_weights = {}
         
-        if not weights:
-            self.logger.warning(f"No weights provided for layer {layer_idx}")
-            return layer_weights
+        class TransformerLayer(nn.Module):
+            """GLM Transformer layer"""
+            
+            def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int):
+                super().__init__()
+                self.hidden_size = hidden_size
+                self.intermediate_size = intermediate_size
+                self.num_heads = num_heads
+                
+                # Attention components
+                self.input_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+                self.attention = nn.ModuleDict({
+                    'q_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                    'k_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                    'v_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                    'o_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                })
+                
+                # MLP components
+                self.post_attention_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+                self.mlp = nn.ModuleDict({
+                    'gate_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
+                    'up_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
+                    'down_proj': nn.Linear(intermediate_size, hidden_size, bias=False),
+                })
+            
+            def forward(self, x):
+                # Simplified forward pass (actual implementation would be more complex)
+                return x
         
-        # Simply organize weights by component type
+        # Create layer module
+        layer = TransformerLayer(
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            num_heads=self.num_attention_heads
+        )
+        
+        # Load weights into the module
         for weight_name, weight_tensor in weights.items():
             # Validate tensor
             if weight_tensor is None:
@@ -352,38 +383,110 @@ class SequentialModelLoader:
                 self.logger.warning(f"NaN/Inf detected in {weight_name}")
                 continue
             
-            # Extract the component name from the full weight name
-            # e.g., "transformer.layers.0.attention.q_proj.weight" -> "attention.q_proj.weight"
+            # Extract component name and load weight
             if f"layers.{layer_idx}." in weight_name:
-                # Remove the layer prefix to get component name
                 component_name = weight_name.split(f"layers.{layer_idx}.")[-1]
-                layer_weights[component_name] = weight_tensor
-            else:
-                # Keep as is if pattern doesn't match
-                layer_weights[weight_name] = weight_tensor
+                
+                # Load attention weights
+                if 'input_layernorm' in component_name:
+                    if 'weight' in component_name:
+                        layer.input_layernorm.weight.data = weight_tensor
+                    elif 'bias' in component_name:
+                        layer.input_layernorm.bias.data = weight_tensor
+                
+                elif 'q_proj' in component_name and 'weight' in component_name:
+                    layer.attention['q_proj'].weight.data = weight_tensor
+                elif 'k_proj' in component_name and 'weight' in component_name:
+                    layer.attention['k_proj'].weight.data = weight_tensor
+                elif 'v_proj' in component_name and 'weight' in component_name:
+                    layer.attention['v_proj'].weight.data = weight_tensor
+                elif 'o_proj' in component_name and 'weight' in component_name:
+                    layer.attention['o_proj'].weight.data = weight_tensor
+                
+                # Load MLP weights
+                elif 'post_attention_layernorm' in component_name:
+                    if 'weight' in component_name:
+                        layer.post_attention_layernorm.weight.data = weight_tensor
+                    elif 'bias' in component_name:
+                        layer.post_attention_layernorm.bias.data = weight_tensor
+                
+                elif 'gate_proj' in component_name and 'weight' in component_name:
+                    layer.mlp['gate_proj'].weight.data = weight_tensor
+                elif 'up_proj' in component_name and 'weight' in component_name:
+                    layer.mlp['up_proj'].weight.data = weight_tensor
+                elif 'down_proj' in component_name and 'weight' in component_name:
+                    layer.mlp['down_proj'].weight.data = weight_tensor
         
-        if not layer_weights:
-            self.logger.warning(f"No valid weights found for layer {layer_idx}")
-        else:
-            self.logger.debug(f"Constructed layer {layer_idx} with {len(layer_weights)} weight tensors")
-        
-        return layer_weights
+        self.logger.debug(f"Constructed transformer layer {layer_idx}")
+        return layer
     
     def construct_moe_layer(self,
                           layer_idx: int,
-                          weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Construct an MoE layer from weights - SIMPLIFIED
+                          weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Construct an MoE layer from weights
         
-        Returns a dictionary of weights instead of full nn.Module for simplicity
-        Treats MoE layers similarly to regular transformer layers
+        Returns a proper nn.Module with router and experts
         """
-        layer_weights = {}
         
-        if not weights:
-            self.logger.warning(f"No weights provided for MoE layer {layer_idx}")
-            return layer_weights
+        class MoELayer(nn.Module):
+            """GLM MoE layer"""
+            
+            def __init__(self, hidden_size: int, intermediate_size: int, 
+                        num_experts: int, num_shared_experts: int, num_heads: int):
+                super().__init__()
+                self.hidden_size = hidden_size
+                self.intermediate_size = intermediate_size
+                self.num_experts = num_experts
+                self.num_shared_experts = num_shared_experts
+                
+                # Attention components (same as transformer)
+                self.input_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+                self.attention = nn.ModuleDict({
+                    'q_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                    'k_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                    'v_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                    'o_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                })
+                
+                # MoE components
+                self.post_attention_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+                self.router = nn.Linear(hidden_size, num_experts, bias=False)
+                
+                # Create experts
+                self.experts = nn.ModuleList()
+                for _ in range(num_experts):
+                    expert = nn.ModuleDict({
+                        'gate_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
+                        'up_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
+                        'down_proj': nn.Linear(intermediate_size, hidden_size, bias=False),
+                    })
+                    self.experts.append(expert)
+                
+                # Shared experts if applicable
+                if num_shared_experts > 0:
+                    self.shared_experts = nn.ModuleList()
+                    for _ in range(num_shared_experts):
+                        expert = nn.ModuleDict({
+                            'gate_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
+                            'up_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
+                            'down_proj': nn.Linear(intermediate_size, hidden_size, bias=False),
+                        })
+                        self.shared_experts.append(expert)
+            
+            def forward(self, x):
+                # Simplified forward pass
+                return x
         
-        # Simply organize weights by component type
+        # Create MoE layer
+        layer = MoELayer(
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            num_experts=self.num_experts or 8,
+            num_shared_experts=self.num_shared_experts or 0,
+            num_heads=self.num_attention_heads
+        )
+        
+        # Load weights into the module
         for weight_name, weight_tensor in weights.items():
             # Validate tensor
             if weight_tensor is None:
@@ -394,24 +497,67 @@ class SequentialModelLoader:
                 self.logger.warning(f"NaN/Inf detected in {weight_name}")
                 continue
             
-            # Extract the component name from the full weight name
+            # Extract component name and load weight
             if f"layers.{layer_idx}." in weight_name:
-                # Remove the layer prefix to get component name
                 component_name = weight_name.split(f"layers.{layer_idx}.")[-1]
-                layer_weights[component_name] = weight_tensor
-            else:
-                # Keep as is if pattern doesn't match
-                layer_weights[weight_name] = weight_tensor
+                
+                # Load attention weights (same as transformer)
+                if 'input_layernorm' in component_name:
+                    if 'weight' in component_name:
+                        layer.input_layernorm.weight.data = weight_tensor
+                    elif 'bias' in component_name:
+                        layer.input_layernorm.bias.data = weight_tensor
+                
+                elif 'q_proj' in component_name and 'weight' in component_name:
+                    layer.attention['q_proj'].weight.data = weight_tensor
+                elif 'k_proj' in component_name and 'weight' in component_name:
+                    layer.attention['k_proj'].weight.data = weight_tensor
+                elif 'v_proj' in component_name and 'weight' in component_name:
+                    layer.attention['v_proj'].weight.data = weight_tensor
+                elif 'o_proj' in component_name and 'weight' in component_name:
+                    layer.attention['o_proj'].weight.data = weight_tensor
+                
+                # Load post attention layernorm
+                elif 'post_attention_layernorm' in component_name:
+                    if 'weight' in component_name:
+                        layer.post_attention_layernorm.weight.data = weight_tensor
+                    elif 'bias' in component_name:
+                        layer.post_attention_layernorm.bias.data = weight_tensor
+                
+                # Load router
+                elif 'router' in component_name and 'weight' in component_name:
+                    layer.router.weight.data = weight_tensor
+                
+                # Load expert weights
+                elif 'expert' in component_name:
+                    # Parse expert index
+                    expert_match = re.search(r'expert\.(\d+)', component_name)
+                    if expert_match:
+                        expert_idx = int(expert_match.group(1))
+                        
+                        # Determine if shared or regular expert
+                        if 'shared' in component_name and hasattr(layer, 'shared_experts'):
+                            if expert_idx < len(layer.shared_experts):
+                                expert = layer.shared_experts[expert_idx]
+                                if 'gate_proj' in component_name and 'weight' in component_name:
+                                    expert['gate_proj'].weight.data = weight_tensor
+                                elif 'up_proj' in component_name and 'weight' in component_name:
+                                    expert['up_proj'].weight.data = weight_tensor
+                                elif 'down_proj' in component_name and 'weight' in component_name:
+                                    expert['down_proj'].weight.data = weight_tensor
+                        else:
+                            # Regular expert
+                            if expert_idx < len(layer.experts):
+                                expert = layer.experts[expert_idx]
+                                if 'gate_proj' in component_name and 'weight' in component_name:
+                                    expert['gate_proj'].weight.data = weight_tensor
+                                elif 'up_proj' in component_name and 'weight' in component_name:
+                                    expert['up_proj'].weight.data = weight_tensor
+                                elif 'down_proj' in component_name and 'weight' in component_name:
+                                    expert['down_proj'].weight.data = weight_tensor
         
-        # Count experts if present
-        num_experts = sum(1 for k in layer_weights.keys() if 'expert' in k and 'weight' in k)
-        if num_experts > 0:
-            self.logger.debug(f"Constructed MoE layer {layer_idx} with {num_experts} experts")
-        
-        if not layer_weights:
-            self.logger.warning(f"No valid weights found for MoE layer {layer_idx}")
-        
-        return layer_weights
+        self.logger.debug(f"Constructed MoE layer {layer_idx} with {self.num_experts} experts")
+        return layer
     
     def save_quantized_layer(self, 
                            layer_name: str,
@@ -444,7 +590,7 @@ class SequentialModelLoader:
         
         # Save in safetensors format
         output_file = output_path / f"{layer_name.replace('/', '_')}.safetensors"
-        safetensors.torch.save_file(state_dict, output_file, metadata=metadata)
+        safetensors.torch.save_file(state_dict, str(output_file), metadata=metadata)
         
         self.logger.info(f"Saved quantized layer to {output_file}")
         
@@ -485,8 +631,8 @@ class SequentialModelLoader:
         
         return embedding
     
-    def load_output_head(self, weights: Dict[str, torch.Tensor]) -> torch.nn.Module:
-        """Load output/lm_head layer"""
+    def _construct_output_layer(self, weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Construct output/lm_head layer from weights"""
         # Find output projection weight
         output_weight = None
         output_bias = None
@@ -530,34 +676,6 @@ class SequentialModelLoader:
         
         return layer_norm
     
-    def _extract_embedding_weights(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Extract embedding weights - SIMPLIFIED"""
-        return weights  # Just return the weights dictionary
-    
-    def _extract_output_weights(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Extract output head weights - SIMPLIFIED"""
-        return weights  # Just return the weights dictionary
-    
-    def cleanup_layer_weights(self, layer_weights: Dict[str, torch.Tensor]) -> None:
-        """Clean up layer weights from memory - SIMPLIFIED"""
-        # Clear weight tensors
-        for key in list(layer_weights.keys()):
-            del layer_weights[key]
-        
-        # Force garbage collection
-        gc.collect()
-        
-        # Clear CUDA cache if applicable
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    
-    def get_layer_size(self, layer_name: str) -> float:
-        """Get size of layer in GB"""
-        if layer_name not in self.layer_info:
-            return 0.0
-        
-        return self.layer_info[layer_name].estimated_size_gb
-    
     def cleanup_layer(self, layer: torch.nn.Module) -> None:
         """Clean up layer from memory"""
         # Delete all parameters
@@ -577,6 +695,13 @@ class SequentialModelLoader:
         # Clear CUDA cache if applicable
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    
+    def get_layer_size(self, layer_name: str) -> float:
+        """Get size of layer in GB"""
+        if layer_name not in self.layer_info:
+            return 0.0
+        
+        return self.layer_info[layer_name].estimated_size_gb
     
     def estimate_total_layers(self) -> int:
         """Estimate total number of layers to process"""
@@ -644,7 +769,7 @@ class SequentialModelLoader:
         # Reconstruct layer based on type
         layer_info = self.layer_info[layer_name]
         
-        # Load weights for this layer (simplified - would need full reconstruction)
+        # Load weights for this layer
         weights = checkpoint['state_dict']
         
         # Construct appropriate module

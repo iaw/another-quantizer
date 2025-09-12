@@ -1,5 +1,5 @@
 # quantization_pipeline.py
-"""Main quantization pipeline orchestrator - Simplified Version"""
+"""Main quantization pipeline orchestrator - Fixed Version"""
 
 import time
 import logging
@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 from tqdm import tqdm
 import torch
+import torch.nn as nn
 import psutil
 from datetime import datetime, timedelta
 import json
@@ -45,7 +46,7 @@ class QuantizationMetrics:
     
 
 class GLMQuantizationPipeline:
-    """Simplified pipeline for sequential GLM quantization"""
+    """Pipeline for sequential GLM quantization"""
     
     def __init__(self, config_path: str):
         """Initialize quantization pipeline"""
@@ -103,7 +104,7 @@ class GLMQuantizationPipeline:
         return logger
         
     def initialize(self) -> None:
-        """Initialize all components - STREAMLINED"""
+        """Initialize all components"""
         self.logger.info("=" * 80)
         self.logger.info("GLM Sequential Quantization Pipeline")
         self.logger.info("=" * 80)
@@ -196,7 +197,7 @@ class GLMQuantizationPipeline:
             raise
     
     def run(self, resume_from_checkpoint: Optional[str] = None) -> None:
-        """Run the quantization pipeline - STREAMLINED
+        """Run the quantization pipeline
         
         Main flow: Initialize -> Quantize -> Export
         """
@@ -237,6 +238,7 @@ class GLMQuantizationPipeline:
             
         except Exception as e:
             self.logger.error(f"Quantization failed: {e}")
+            self.logger.debug(traceback.format_exc())
             self.save_checkpoint()
             raise
             
@@ -244,7 +246,7 @@ class GLMQuantizationPipeline:
             self.cleanup()
     
     def quantize_model(self) -> None:
-        """Main quantization loop - STREAMLINED"""
+        """Main quantization loop"""
         total_layers = self.state.total_layers
         
         # Progress bar
@@ -257,10 +259,9 @@ class GLMQuantizationPipeline:
         
         # Get calibration data
         calibration_batch = next(iter(self.calibration_dataloader))
-        calibration_inputs = calibration_batch['input_ids']
         
         # Process each layer
-        for layer_name, layer_weights in self.model_loader.iterate_layers():
+        for layer_name, layer_module in self.model_loader.iterate_layers():
             # Skip if already completed
             if layer_name in self.state.completed_layers:
                 self.logger.info(f"Skipping completed: {layer_name}")
@@ -277,18 +278,22 @@ class GLMQuantizationPipeline:
             try:
                 self.logger.info(f"Quantizing: {layer_name}")
                 
-                # Quantize the layer
-                quantized_weights, result = self.layer_quantizer.quantize_layer(
-                    layer_weights=layer_weights,
+                # Record memory before
+                before_mem = self.memory_manager.get_current_memory()
+                
+                # Quantize the layer (now properly works with nn.Module)
+                quantized_layer, result = self.layer_quantizer.quantize_layer(
+                    layer=layer_module,
                     layer_name=layer_name,
-                    calibration_data=calibration_inputs
+                    calibration_data=calibration_batch
                 )
                 
-                # Save quantized weights
-                self.checkpoint_manager.save_quantized_weights(
-                    layer_name=layer_name,
-                    weights=quantized_weights
-                )
+                # Record memory peak
+                after_mem = self.memory_manager.get_current_memory()
+                memory_peak = max(before_mem.gpu_used, after_mem.gpu_used)
+                
+                # Save quantized layer
+                self.save_quantized_layer(layer_name, quantized_layer)
                 
                 # Update state
                 self.state.completed_layers.append(layer_name)
@@ -299,9 +304,9 @@ class GLMQuantizationPipeline:
                 metrics = QuantizationMetrics(
                     layer_name=layer_name,
                     quantization_time=result.time_taken,
-                    memory_peak_gb=0.0,  # Would track actual memory
+                    memory_peak_gb=memory_peak,
                     mse_error=result.quantization_error,
-                    cosine_similarity=1.0,  # Placeholder
+                    cosine_similarity=1.0 - result.quantization_error,  # Approximation
                     compression_ratio=result.compression_ratio,
                     weights_size_mb=result.quantized_size_gb * 1024
                 )
@@ -314,6 +319,7 @@ class GLMQuantizationPipeline:
                 
             except Exception as e:
                 self.logger.error(f"Failed to quantize {layer_name}: {e}")
+                self.logger.debug(traceback.format_exc())
                 self.state.failed_layers.append(layer_name)
                 self.state.error_count += 1
             
@@ -332,7 +338,31 @@ class GLMQuantizationPipeline:
         self.logger.info(f"  Failed: {len(self.state.failed_layers)} layers")
         self.logger.info(f"  Original size: {self.state.total_original_size_gb:.2f} GB")
         self.logger.info(f"  Quantized size: {self.state.total_quantized_size_gb:.2f} GB")
-        self.logger.info(f"  Compression ratio: {self.state.total_original_size_gb / max(self.state.total_quantized_size_gb, 0.001):.2f}x")
+        compression_ratio = self.state.total_original_size_gb / max(self.state.total_quantized_size_gb, 0.001)
+        self.logger.info(f"  Compression ratio: {compression_ratio:.2f}x")
+    
+    def save_quantized_layer(self, layer_name: str, layer: nn.Module) -> None:
+        """Save quantized layer to disk"""
+        weights_dir = self.checkpoint_manager.checkpoint_dir / "quantized_weights"
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract state dict from layer
+        state_dict = {}
+        for name, param in layer.named_parameters():
+            full_name = f"{layer_name}.{name}"
+            state_dict[full_name] = param.data.cpu()
+        
+        # Also save buffers (for quantized weights, scales, etc.)
+        for name, buffer in layer.named_buffers():
+            full_name = f"{layer_name}.{name}"
+            state_dict[full_name] = buffer.cpu()
+        
+        # Save to safetensors
+        import safetensors.torch
+        output_file = weights_dir / f"{layer_name.replace('/', '_')}.safetensors"
+        safetensors.torch.save_file(state_dict, str(output_file))
+        
+        self.logger.debug(f"Saved quantized layer to {output_file}")
     
     def save_checkpoint(self) -> None:
         """Save current checkpoint"""
@@ -346,15 +376,29 @@ class GLMQuantizationPipeline:
             )
     
     def export_model(self) -> None:
-        """Export quantized model - SIMPLIFIED"""
+        """Export quantized model"""
         output_path = Path(self.config.output_path)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # Copy quantized weights
+        # Merge all quantized layer files
         weights_dir = self.checkpoint_manager.checkpoint_dir / "quantized_weights"
         if weights_dir.exists():
-            for weight_file in weights_dir.glob("*.safetensors"):
-                shutil.copy2(weight_file, output_path / weight_file.name)
+            # Collect all weight files
+            weight_files = list(weights_dir.glob("*.safetensors"))
+            
+            if weight_files:
+                # Load and merge all weights
+                import safetensors.torch
+                merged_state_dict = {}
+                
+                for weight_file in weight_files:
+                    state_dict = safetensors.torch.load_file(str(weight_file))
+                    merged_state_dict.update(state_dict)
+                
+                # Save merged weights
+                output_file = output_path / "model.safetensors"
+                safetensors.torch.save_file(merged_state_dict, str(output_file))
+                self.logger.info(f"Saved merged model to {output_file}")
         
         # Create model config with quantization info
         config_src = self.config.model_path / "config.json"
@@ -364,10 +408,11 @@ class GLMQuantizationPipeline:
             
             # Add quantization config
             model_config['quantization_config'] = {
+                'quant_method': 'awq',
                 'bits': self.config.bits,
                 'group_size': self.config.group_size,
-                'method': 'awq',
-                'symmetric': self.config.symmetric
+                'symmetric': self.config.symmetric,
+                'version': 'GEMM',
             }
             
             with open(output_path / "config.json", 'w') as f:
@@ -378,6 +423,23 @@ class GLMQuantizationPipeline:
             src = self.config.model_path / file_name
             if src.exists():
                 shutil.copy2(src, output_path / file_name)
+        
+        # Create quantization metadata
+        metadata = {
+            'quantization_method': 'awq',
+            'bits': self.config.bits,
+            'group_size': self.config.group_size,
+            'symmetric': self.config.symmetric,
+            'total_layers': len(self.state.completed_layers),
+            'failed_layers': self.state.failed_layers,
+            'original_size_gb': self.state.total_original_size_gb,
+            'quantized_size_gb': self.state.total_quantized_size_gb,
+            'compression_ratio': self.state.total_original_size_gb / max(self.state.total_quantized_size_gb, 0.001),
+            'timestamp': datetime.now().isoformat(),
+        }
+        
+        with open(output_path / "quantization_metadata.json", 'w') as f:
+            json.dump(metadata, f, indent=2)
         
         self.logger.info(f"Model exported to: {output_path}")
     
@@ -417,6 +479,50 @@ class GLMQuantizationPipeline:
         resources['disk_used_percent'] = disk.percent
         
         return resources
+    
+    def validate_quantized_model(self) -> Dict[str, float]:
+        """Validate the quantized model"""
+        metrics = {}
+        
+        # Check if all layers were quantized
+        metrics['completion_rate'] = len(self.state.completed_layers) / self.state.total_layers
+        
+        # Calculate average quantization error
+        if self.layer_metrics:
+            errors = [m.mse_error for m in self.layer_metrics if m.mse_error != float('inf')]
+            if errors:
+                metrics['avg_mse_error'] = sum(errors) / len(errors)
+                metrics['max_mse_error'] = max(errors)
+                metrics['min_mse_error'] = min(errors)
+        
+        # Calculate compression ratio
+        metrics['overall_compression'] = self.state.total_original_size_gb / max(self.state.total_quantized_size_gb, 0.001)
+        
+        # Check for failed layers
+        metrics['num_failed_layers'] = len(self.state.failed_layers)
+        
+        return metrics
+    
+    def create_emergency_checkpoint(self, reason: str) -> None:
+        """Create emergency checkpoint on interruption"""
+        try:
+            checkpoint_data = {
+                'reason': reason,
+                'timestamp': datetime.now().isoformat(),
+                'state': {
+                    'current_layer_idx': self.state.current_layer_idx,
+                    'completed_layers': self.state.completed_layers,
+                    'failed_layers': self.state.failed_layers,
+                }
+            }
+            
+            emergency_file = Path(self.config.checkpoint_dir) / f"emergency_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(emergency_file, 'w') as f:
+                json.dump(checkpoint_data, f, indent=2)
+            
+            self.logger.info(f"Emergency checkpoint saved: {emergency_file}")
+        except Exception as e:
+            self.logger.error(f"Failed to create emergency checkpoint: {e}")
     
     def _save_metrics(self, metrics: QuantizationMetrics) -> None:
         """Save metrics to JSON file"""

@@ -1,5 +1,5 @@
 # llm_compressor_wrapper.py
-"""Wrapper for LLM Compressor AWQ functionality"""
+"""Wrapper for LLM Compressor AWQ functionality - No fallbacks version"""
 
 from typing import Dict, Any, List, Optional, Tuple
 import torch
@@ -10,18 +10,32 @@ from pathlib import Path
 import logging
 import numpy as np
 import gc
-import re  # FIXED: Added missing import
+import re
 
-# LLM Compressor imports
+# LLM Compressor imports - REQUIRED (no fallbacks)
 try:
     from llmcompressor.modifiers.quantization import AWQModifier
     from llmcompressor.transformers import oneshot
     from llmcompressor.modifiers.quantization.utils import create_mapping
-except ImportError:
-    logging.warning("LLM Compressor not installed. Install with: pip install llmcompressor")
-    AWQModifier = None
-    oneshot = None
-    create_mapping = None
+except ImportError as e:
+    error_msg = (
+        "\n" + "="*80 + "\n"
+        "CRITICAL ERROR: LLM Compressor is not installed!\n"
+        "\n"
+        "This quantization pipeline requires LLM Compressor for AWQ quantization.\n"
+        "Please install it using:\n"
+        "\n"
+        "  pip install llmcompressor\n"
+        "\n"
+        "Or install with specific version:\n"
+        "\n"
+        "  pip install llmcompressor==0.1.0\n"
+        "\n"
+        "For more information, visit: https://github.com/vllm-project/llm-compressor\n"
+        + "="*80 + "\n"
+    )
+    print(error_msg)
+    raise ImportError(error_msg) from e
 
 
 @dataclass
@@ -46,16 +60,24 @@ class GLMLayerMapping:
     
 
 class LLMCompressorWrapper:
-    """Wrapper for LLM Compressor AWQ operations"""
+    """Wrapper for LLM Compressor AWQ operations - No fallback version"""
     
     def __init__(self, config: Any):
-        """Initialize LLM Compressor wrapper"""
+        """Initialize LLM Compressor wrapper
+        
+        Raises:
+            ImportError: If LLM Compressor is not installed
+            ValueError: If configuration is invalid
+        """
         self.config = config
         self.awq_modifier = None
         self.layer_mappings = self._create_glm_mappings()
         self.logger = logging.getLogger(__name__)
         self.calibration_cache = {}
         self.awq_scales = {}  # Store computed scales
+        
+        # Verify LLM Compressor is available (no fallback)
+        self._verify_llm_compressor()
         
         # Create AWQ configuration
         self.awq_config = AWQConfig(
@@ -68,29 +90,68 @@ class LLMCompressorWrapper:
             protection_factor=config.awq_protection_factor,
         )
         
-    def create_awq_modifier(self) -> AWQModifier:
-        """Create AWQ modifier with GLM-specific settings"""
-        if AWQModifier is None:
-            raise ImportError("LLM Compressor not installed")
+        self.logger.info("LLM Compressor wrapper initialized successfully")
         
+    def _verify_llm_compressor(self) -> None:
+        """Verify LLM Compressor is properly installed
+        
+        Raises:
+            ImportError: If any required component is missing
+        """
+        required_components = [
+            ('AWQModifier', AWQModifier),
+            ('oneshot', oneshot),
+            ('create_mapping', create_mapping),
+        ]
+        
+        for name, component in required_components:
+            if component is None:
+                raise ImportError(
+                    f"LLM Compressor component '{name}' is not available. "
+                    f"Please ensure LLM Compressor is properly installed: pip install llmcompressor"
+                )
+        
+        # Verify version if possible
+        try:
+            import llmcompressor
+            version = getattr(llmcompressor, '__version__', 'unknown')
+            self.logger.info(f"LLM Compressor version: {version}")
+        except Exception as e:
+            self.logger.warning(f"Could not determine LLM Compressor version: {e}")
+    
+    def create_awq_modifier(self) -> AWQModifier:
+        """Create AWQ modifier with GLM-specific settings
+        
+        Returns:
+            AWQModifier: Configured AWQ modifier
+            
+        Raises:
+            RuntimeError: If AWQ modifier creation fails
+        """
         # Get GLM-specific mappings
         mappings = self.get_glm_mappings()
         
-        # Create AWQ modifier
-        self.awq_modifier = AWQModifier(
-            mappings=mappings,
-            bits=self.awq_config.bits,
-            group_size=self.awq_config.group_size,
-            symmetric=self.awq_config.symmetric,
-            damping_percent=self.awq_config.damping_percent,
-            targets=["Linear"],  # Target Linear layers
-            scheme="W4A16_ASYM" if self.awq_config.bits == 4 else "W8A16",
-            ignore=self.config.skip_layers,  # Skip patterns from config
-        )
-        
-        self.logger.info(f"Created AWQ modifier with {len(mappings)} layer mappings")
-        
-        return self.awq_modifier
+        try:
+            # Create AWQ modifier
+            self.awq_modifier = AWQModifier(
+                mappings=mappings,
+                bits=self.awq_config.bits,
+                group_size=self.awq_config.group_size,
+                symmetric=self.awq_config.symmetric,
+                damping_percent=self.awq_config.damping_percent,
+                targets=["Linear"],  # Target Linear layers
+                scheme="W4A16_ASYM" if self.awq_config.bits == 4 else "W8A16",
+                ignore=self.config.skip_layers,  # Skip patterns from config
+            )
+            
+            self.logger.info(f"Created AWQ modifier with {len(mappings)} layer mappings")
+            
+            return self.awq_modifier
+            
+        except Exception as e:
+            error_msg = f"Failed to create AWQ modifier: {e}"
+            self.logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
     
     def get_glm_mappings(self) -> List[List[str]]:
         """Get GLM-specific layer mappings for AWQ"""
@@ -131,44 +192,94 @@ class LLMCompressorWrapper:
     
     def _create_glm_mappings(self) -> List[GLMLayerMapping]:
         """Create GLM layer mappings (internal)"""
-        # Return empty list as this is just internal bookkeeping
-        return []
+        mappings = [
+            GLMLayerMapping(
+                input_pattern="input_layernorm",
+                output_patterns=["q_proj", "k_proj", "v_proj"],
+                layer_type="attention"
+            ),
+            GLMLayerMapping(
+                input_pattern="v_proj",
+                output_patterns=["o_proj"],
+                layer_type="attention"
+            ),
+            GLMLayerMapping(
+                input_pattern="post_attention_layernorm",
+                output_patterns=["gate_proj", "up_proj"],
+                layer_type="mlp"
+            ),
+            GLMLayerMapping(
+                input_pattern="up_proj",
+                output_patterns=["down_proj"],
+                layer_type="mlp"
+            ),
+        ]
+        return mappings
     
     def quantize_layer_with_awq(self,
                                layer: torch.nn.Module,
                                layer_name: str,
                                calibration_inputs: torch.Tensor) -> torch.nn.Module:
-        """Quantize single layer using AWQ"""
+        """Quantize single layer using AWQ
+        
+        Args:
+            layer: Layer module to quantize
+            layer_name: Name of the layer
+            calibration_inputs: Calibration data
+            
+        Returns:
+            Quantized layer module
+            
+        Raises:
+            RuntimeError: If quantization fails
+        """
         self.logger.info(f"Quantizing layer: {layer_name}")
         
-        # Move layer to GPU if available and possible
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        layer = layer.to(device)
-        calibration_inputs = calibration_inputs.to(device)
-        
-        # Compute AWQ scales
-        scales = self.compute_scaling_factors(layer, calibration_inputs)
-        
-        # Apply scales to weights
-        self._apply_scales_to_layer(layer, scales)
-        
-        # Quantize weights
-        quantized_layer = self._quantize_layer_weights(layer, scales)
-        
-        # Move back to CPU if needed
-        if self.config.offload_to_cpu:
-            quantized_layer = quantized_layer.to('cpu')
-        
-        # Clear GPU cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return quantized_layer
+        try:
+            # Move layer to GPU if available and possible
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            layer = layer.to(device)
+            calibration_inputs = calibration_inputs.to(device)
+            
+            # Compute AWQ scales
+            scales = self.compute_scaling_factors(layer, calibration_inputs)
+            
+            # Apply scales to weights
+            self._apply_scales_to_layer(layer, scales)
+            
+            # Quantize weights
+            quantized_layer = self._quantize_layer_weights(layer, scales)
+            
+            # Move back to CPU if needed
+            if self.config.offload_to_cpu:
+                quantized_layer = quantized_layer.to('cpu')
+            
+            # Clear GPU cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            return quantized_layer
+            
+        except Exception as e:
+            error_msg = f"Failed to quantize layer {layer_name}: {e}"
+            self.logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
     
     def compute_scaling_factors(self,
                                layer: torch.nn.Module,
                                inputs: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Compute AWQ scaling factors"""
+        """Compute AWQ scaling factors
+        
+        Args:
+            layer: Layer module
+            inputs: Input activations
+            
+        Returns:
+            Dictionary of scaling factors per module
+            
+        Raises:
+            RuntimeError: If scale computation fails
+        """
         scales = {}
         
         # Hook to capture activations
@@ -199,9 +310,11 @@ class LLMCompressorWrapper:
             # Forward pass
             try:
                 _ = layer(inputs)
-            except:
-                # Some layers might need different forward signature
-                pass
+            except Exception as e:
+                # Remove hooks before raising
+                for handle in hooks:
+                    handle.remove()
+                raise RuntimeError(f"Failed to compute activations: {e}") from e
         
         # Remove hooks
         for handle in hooks:
@@ -244,62 +357,89 @@ class LLMCompressorWrapper:
                          weights: torch.Tensor,
                          scales: torch.Tensor,
                          group_size: int = 128) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Apply quantization with scaling factors"""
-        # Apply AWQ scales
-        W_scaled = weights * scales.unsqueeze(0)
+        """Apply quantization with scaling factors
         
-        # Prepare for group-wise quantization
-        orig_shape = W_scaled.shape
-        W_scaled = W_scaled.reshape(-1, group_size)
-        
-        # Quantize each group
-        num_groups = W_scaled.shape[0]
-        bits = self.awq_config.bits
-        max_val = 2**bits - 1
-        
-        group_scales = torch.zeros(num_groups, dtype=torch.float16, device=W_scaled.device)
-        group_zeros = torch.zeros(num_groups, dtype=torch.float16, device=W_scaled.device)
-        W_quant = torch.zeros_like(W_scaled, dtype=torch.uint8)
-        
-        for i in range(num_groups):
-            group = W_scaled[i]
+        Args:
+            weights: Weight tensor to quantize
+            scales: AWQ scaling factors
+            group_size: Group size for quantization
             
-            # Find min and max
-            min_val = group.min().item()
-            max_val_group = group.max().item()
+        Returns:
+            Tuple of (quantized_weights, metadata)
             
-            # Compute scale and zero point
-            scale = (max_val_group - min_val) / max_val if max_val_group != min_val else 1.0
-            zero_point = round(-min_val / scale) if scale != 0 else 0
+        Raises:
+            RuntimeError: If quantization fails
+        """
+        try:
+            # Apply AWQ scales
+            W_scaled = weights * scales.unsqueeze(0)
             
-            # Quantize
-            group_quant = torch.round(group / scale + zero_point)
-            group_quant = torch.clamp(group_quant, 0, max_val)
+            # Prepare for group-wise quantization
+            orig_shape = W_scaled.shape
+            W_scaled = W_scaled.reshape(-1, group_size)
             
-            W_quant[i] = group_quant.to(torch.uint8)
-            group_scales[i] = scale
-            group_zeros[i] = zero_point
-        
-        # Pack weights if INT4
-        if bits == 4:
-            W_packed = self.pack_weights(W_quant.reshape(orig_shape), bits=4)
-        else:
-            W_packed = W_quant.reshape(orig_shape)
-        
-        metadata = {
-            "scales": group_scales,
-            "zeros": group_zeros,
-            "group_size": group_size,
-            "bits": bits,
-            "shape": orig_shape,
-        }
-        
-        return W_packed, metadata
+            # Quantize each group
+            num_groups = W_scaled.shape[0]
+            bits = self.awq_config.bits
+            max_val = 2**bits - 1
+            
+            group_scales = torch.zeros(num_groups, dtype=torch.float16, device=W_scaled.device)
+            group_zeros = torch.zeros(num_groups, dtype=torch.float16, device=W_scaled.device)
+            W_quant = torch.zeros_like(W_scaled, dtype=torch.uint8)
+            
+            for i in range(num_groups):
+                group = W_scaled[i]
+                
+                # Find min and max
+                min_val = group.min().item()
+                max_val_group = group.max().item()
+                
+                # Compute scale and zero point
+                scale = (max_val_group - min_val) / max_val if max_val_group != min_val else 1.0
+                zero_point = round(-min_val / scale) if scale != 0 else 0
+                
+                # Quantize
+                group_quant = torch.round(group / scale + zero_point)
+                group_quant = torch.clamp(group_quant, 0, max_val)
+                
+                W_quant[i] = group_quant.to(torch.uint8)
+                group_scales[i] = scale
+                group_zeros[i] = zero_point
+            
+            # Pack weights if INT4
+            if bits == 4:
+                W_packed = self.pack_weights(W_quant.reshape(orig_shape), bits=4)
+            else:
+                W_packed = W_quant.reshape(orig_shape)
+            
+            metadata = {
+                "scales": group_scales,
+                "zeros": group_zeros,
+                "group_size": group_size,
+                "bits": bits,
+                "shape": orig_shape,
+            }
+            
+            return W_packed, metadata
+            
+        except Exception as e:
+            raise RuntimeError(f"Quantization failed: {e}") from e
     
     def pack_weights(self, 
                      quantized_weights: torch.Tensor,
                      bits: int = 4) -> torch.Tensor:
-        """Pack quantized weights for storage"""
+        """Pack quantized weights for storage
+        
+        Args:
+            quantized_weights: Quantized weight tensor
+            bits: Bit width
+            
+        Returns:
+            Packed weight tensor
+            
+        Raises:
+            ValueError: If bit width is not supported
+        """
         if bits == 4:
             # Pack 2 INT4 values per byte
             orig_shape = quantized_weights.shape
@@ -327,10 +467,17 @@ class LLMCompressorWrapper:
             return quantized_weights.to(torch.int8)
         
         else:
-            raise ValueError(f"Unsupported bit width: {bits}")
+            raise ValueError(f"Unsupported bit width: {bits}. Only 4 and 8 bits are supported.")
     
-    def create_layer_config(self, layer_name: str) -> Dict[str, Any]:
-        """Create quantization config for specific layer"""
+    def create_layer_config(self, layer_name: str) -> Optional[Dict[str, Any]]:
+        """Create quantization config for specific layer
+        
+        Args:
+            layer_name: Name of the layer
+            
+        Returns:
+            Configuration dictionary or None if layer should be skipped
+        """
         # Check if layer should be quantized
         for skip_pattern in self.config.skip_layers:
             if skip_pattern.replace('*', '') in layer_name:
@@ -367,7 +514,14 @@ class LLMCompressorWrapper:
             }
     
     def should_skip_layer(self, layer_name: str) -> bool:
-        """Check if layer should be skipped"""
+        """Check if layer should be skipped
+        
+        Args:
+            layer_name: Name of the layer
+            
+        Returns:
+            True if layer should be skipped
+        """
         skip_patterns = [
             "lm_head",
             "embed",
@@ -392,49 +546,80 @@ class LLMCompressorWrapper:
     def prepare_oneshot_config(self,
                               model: nn.Module,
                               calibration_data: Any) -> Dict[str, Any]:
-        """Prepare configuration for oneshot quantization"""
-        if AWQModifier is None:
-            raise ImportError("LLM Compressor not installed")
+        """Prepare configuration for oneshot quantization
         
-        # Create AWQ modifier
-        awq_modifier = self.create_awq_modifier()
-        
-        # Create recipe
-        recipe = [awq_modifier]
-        
-        # Configuration dictionary
-        config = {
-            "recipe": recipe,
-            "dataset": calibration_data,
-            "max_seq_length": self.config.max_position_embeddings,
-            "num_calibration_samples": self.config.calibration_samples,
-            "device": "cuda" if torch.cuda.is_available() else "cpu",
-        }
-        
-        return config
+        Args:
+            model: Model to quantize
+            calibration_data: Calibration dataset
+            
+        Returns:
+            Configuration dictionary for oneshot
+            
+        Raises:
+            RuntimeError: If configuration preparation fails
+        """
+        try:
+            # Create AWQ modifier
+            awq_modifier = self.create_awq_modifier()
+            
+            # Create recipe
+            recipe = [awq_modifier]
+            
+            # Configuration dictionary
+            config = {
+                "recipe": recipe,
+                "dataset": calibration_data,
+                "max_seq_length": self.config.max_position_embeddings,
+                "num_calibration_samples": self.config.calibration_samples,
+                "device": "cuda" if torch.cuda.is_available() else "cpu",
+            }
+            
+            return config
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to prepare oneshot config: {e}") from e
     
     def run_oneshot_quantization(self,
                                 model: nn.Module,
                                 config: Dict[str, Any]) -> nn.Module:
-        """Run oneshot quantization on entire model"""
-        if oneshot is None:
-            raise ImportError("LLM Compressor oneshot not available")
+        """Run oneshot quantization on entire model
         
-        # Run oneshot quantization
-        quantized_model = oneshot(
-            model=model,
-            dataset=config["dataset"],
-            recipe=config["recipe"],
-            max_seq_length=config["max_seq_length"],
-            num_calibration_samples=config["num_calibration_samples"],
-            device=config["device"],
-        )
-        
-        return quantized_model
+        Args:
+            model: Model to quantize
+            config: Oneshot configuration
+            
+        Returns:
+            Quantized model
+            
+        Raises:
+            RuntimeError: If oneshot quantization fails
+        """
+        try:
+            # Run oneshot quantization
+            quantized_model = oneshot(
+                model=model,
+                dataset=config["dataset"],
+                recipe=config["recipe"],
+                max_seq_length=config["max_seq_length"],
+                num_calibration_samples=config["num_calibration_samples"],
+                device=config["device"],
+            )
+            
+            return quantized_model
+            
+        except Exception as e:
+            raise RuntimeError(f"Oneshot quantization failed: {e}") from e
     
     def extract_quantized_state(self,
                                layer: nn.Module) -> Dict[str, torch.Tensor]:
-        """Extract quantized weights and metadata"""
+        """Extract quantized weights and metadata
+        
+        Args:
+            layer: Quantized layer module
+            
+        Returns:
+            Dictionary of quantized state
+        """
         state = {}
         
         for name, module in layer.named_modules():
@@ -458,7 +643,16 @@ class LLMCompressorWrapper:
                                in_features: int,
                                out_features: int,
                                quantized_state: Dict[str, torch.Tensor]) -> nn.Module:
-        """Create custom quantized Linear module"""
+        """Create custom quantized Linear module
+        
+        Args:
+            in_features: Input features
+            out_features: Output features
+            quantized_state: Quantized weights and metadata
+            
+        Returns:
+            Quantized linear module
+        """
         
         class QuantizedLinear(nn.Module):
             """Custom quantized linear layer"""
@@ -521,7 +715,17 @@ class LLMCompressorWrapper:
                             quantized: torch.Tensor,
                             scales: torch.Tensor,
                             zero_points: torch.Tensor) -> Dict[str, float]:
-        """Validate quantization quality"""
+        """Validate quantization quality
+        
+        Args:
+            original: Original weight tensor
+            quantized: Quantized weight tensor
+            scales: Quantization scales
+            zero_points: Quantization zero points
+            
+        Returns:
+            Dictionary of validation metrics
+        """
         # Dequantize for comparison
         if self.awq_config.bits == 4:
             quantized = self.unpack_int4(quantized)
@@ -546,7 +750,15 @@ class LLMCompressorWrapper:
     def optimize_group_size(self,
                           layer: nn.Module,
                           calibration_data: Any) -> int:
-        """Find optimal group size for layer"""
+        """Find optimal group size for layer
+        
+        Args:
+            layer: Layer module
+            calibration_data: Calibration data
+            
+        Returns:
+            Optimal group size
+        """
         group_sizes = [32, 64, 128, 256]
         best_group_size = 128
         best_error = float('inf')
@@ -586,7 +798,15 @@ class LLMCompressorWrapper:
     def handle_moe_quantization(self,
                               moe_layer: nn.Module,
                               calibration_data: Any) -> nn.Module:
-        """Special handling for MoE layers"""
+        """Special handling for MoE layers
+        
+        Args:
+            moe_layer: MoE layer module
+            calibration_data: Calibration data
+            
+        Returns:
+            Quantized MoE layer
+        """
         # Keep router in FP16
         # Router should not be quantized for accuracy
         
@@ -630,7 +850,14 @@ class LLMCompressorWrapper:
     
     def create_vllm_config(self,
                          quantized_model: nn.Module) -> Dict[str, Any]:
-        """Create vLLM-compatible configuration"""
+        """Create vLLM-compatible configuration
+        
+        Args:
+            quantized_model: Quantized model
+            
+        Returns:
+            vLLM configuration dictionary
+        """
         config = {
             "quantization": "awq",
             "weight_bits": self.awq_config.bits,
@@ -647,7 +874,16 @@ class LLMCompressorWrapper:
                                  layer: nn.Module,
                                  test_input: torch.Tensor,
                                  num_runs: int = 100) -> Dict[str, float]:
-        """Benchmark quantized layer performance"""
+        """Benchmark quantized layer performance
+        
+        Args:
+            layer: Quantized layer module
+            test_input: Test input tensor
+            num_runs: Number of benchmark runs
+            
+        Returns:
+            Dictionary of benchmark metrics
+        """
         import time
         
         # Warmup runs
