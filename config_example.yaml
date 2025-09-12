@@ -1,0 +1,37 @@
+# config_example.yaml
+# Example configuration for GLM quantization
+
+# Required paths
+model_path: /models/glm-4-9b        # Path to original model
+output_path: /models/glm-4-9b-int4  # Where to save quantized model
+checkpoint_dir: /models/checkpoints # Checkpoint directory
+
+# Quantization settings
+bits: 4                              # Quantization bits (3, 4, or 8)
+group_size: 128                      # Group size for quantization
+symmetric: false                     # Symmetric vs asymmetric quantization
+
+# Calibration settings
+calibration_samples: 128             # Number of calibration samples
+calibration_batch_size: 2            # Batch size for calibration
+
+# Memory settings
+max_gpu_memory: 20                   # GPU memory limit in GB (auto-detect if not set)
+max_cpu_memory: 64                   # CPU memory limit in GB (auto-detect if not set)
+offload_to_cpu: true                 # Enable CPU offloading for large models
+
+# Processing settings
+checkpoint_every_n_layers: 5         # Save checkpoint every N layers
+max_position_embeddings: 2048        # Maximum sequence length
+
+# AWQ specific settings (optional)
+awq_damping_percent: 0.01            # Damping factor for AWQ
+awq_protection_factor: 1.5           # Protection for salient channels
+
+# Layers to skip (keep in original precision)
+skip_layers:
+  - "lm_head"
+  - "*.layernorm"
+  - "*.norm"
+  - "embedding*"
+  - "*.router"

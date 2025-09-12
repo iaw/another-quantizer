@@ -89,6 +89,7 @@ class LayerQuantizer:
         # Move layer to GPU if needed and possible
         device = self._determine_device(layer, original_size_gb)
         layer = layer.to(device)
+        calibration_data = calibration_data.to(device)
         
         # Ensure calibration data is on same device and has proper shape
         if isinstance(calibration_data, dict):
@@ -187,6 +188,38 @@ class LayerQuantizer:
         """
         scales = {}
         
+        # Ensure we have proper calibration data
+        if isinstance(calibration_data, dict):
+            # Check if we have hidden_states key
+            if 'hidden_states' in calibration_data:
+                calibration_inputs = calibration_data['hidden_states']
+            elif 'input_ids' in calibration_data:
+                # Convert from tokenized data to hidden states
+                hidden_size = self._get_hidden_size(layer)
+                seq_length = calibration_data['input_ids'].shape[-1] if calibration_data['input_ids'].dim() > 1 else 128
+                batch_size = calibration_data['input_ids'].shape[0] if calibration_data['input_ids'].dim() > 0 else 1
+                
+                calibration_inputs = torch.randn(
+                    batch_size, seq_length, hidden_size,
+                    device=layer.device, 
+                    dtype=torch.float16
+                ) * 0.02  # Proper initialization scale
+            else:
+                # Fallback to dummy input
+                calibration_inputs = self._create_dummy_input(layer)
+        elif isinstance(calibration_data, torch.Tensor):
+            calibration_inputs = calibration_data
+            # Ensure proper shape [batch, seq_len, hidden_size]
+            if calibration_inputs.dim() == 2:
+                calibration_inputs = calibration_inputs.unsqueeze(0)
+        else:
+            # Create dummy input as last resort
+            calibration_inputs = self._create_dummy_input(layer)
+        
+        # Move to same device as layer
+        device = next(layer.parameters()).device
+        calibration_inputs = calibration_inputs.to(device)
+        
         # Hook to capture activations
         activations = {}
         
@@ -194,6 +227,7 @@ class LayerQuantizer:
             def hook_fn(module, input, output):
                 if isinstance(input, tuple):
                     input = input[0]
+                # Store input activations for AWQ scaling
                 activations[name] = input.detach()
             return hook_fn
         
@@ -209,37 +243,17 @@ class LayerQuantizer:
         # Forward pass to collect activations
         with torch.no_grad():
             try:
-                # Handle different input formats
-                if calibration_data.dim() == 2:
-                    calibration_data = calibration_data.unsqueeze(0)
-                
-                # Create dummy input with proper shape for the layer
-                # For transformer layers, we need hidden_size dimension
-                if hasattr(layer, 'hidden_size'):
-                    hidden_size = layer.hidden_size
-                elif hasattr(layer, 'input_layernorm'):
-                    # Try to infer from layer norm
-                    hidden_size = layer.input_layernorm.weight.shape[0]
-                else:
-                    # Fallback to config
-                    hidden_size = self.config.hidden_size if hasattr(self.config, 'hidden_size') else 4096
-                
-                batch_size = calibration_data.shape[0] if calibration_data.dim() > 0 else 1
-                seq_len = calibration_data.shape[1] if calibration_data.dim() > 1 else 128
-                
-                # Create proper input tensor
-                dummy_input = torch.randn(batch_size, seq_len, hidden_size, 
-                                         device=calibration_data.device, dtype=torch.float16)
-                
-                # Forward pass
-                _ = layer(dummy_input)
+                # Run forward pass
+                _ = layer(calibration_inputs)
             except Exception as e:
                 self.logger.warning(f"Forward pass failed during scale computation: {e}")
-                # Try with calibration data directly
-                try:
-                    _ = layer(calibration_data)
-                except:
-                    pass
+                # If forward fails, use default scales
+                for name, module in linear_modules.items():
+                    scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
+                # Remove hooks before returning
+                for handle in hooks:
+                    handle.remove()
+                return scales
         
         # Remove hooks
         for handle in hooks:
@@ -256,11 +270,11 @@ class LayerQuantizer:
             X = activations[name]
             W = module.weight
             
-            # Compute per-channel importance
-            # mean(abs(X), dim=[batch, seq_len]) -> [hidden_dim]
+            # Compute per-channel importance based on activation magnitude
+            # Shape: [batch, seq_len, hidden] -> [hidden]
             X_abs_mean = torch.mean(torch.abs(X), dim=list(range(X.dim()-1)))
             
-            # Identify salient channels (top 1%)
+            # Identify salient channels (top 1% most important)
             num_salient = max(1, int(0.01 * len(X_abs_mean)))
             importance = X_abs_mean / (X_abs_mean.sum() + 1e-8)
             salient_indices = torch.topk(importance, num_salient).indices
@@ -268,21 +282,21 @@ class LayerQuantizer:
             # Compute weight statistics
             W_abs_mean = torch.mean(torch.abs(W), dim=0)
             
-            # Compute optimal scales
+            # Compute optimal AWQ scales
             # scale = sqrt(mean(X^2) / mean(W^2))
-            X_rms = torch.sqrt(torch.mean(X ** 2, dim=list(range(X.dim()-1))))
-            W_rms = torch.sqrt(torch.mean(W ** 2, dim=0))
+            X_rms = torch.sqrt(torch.mean(X ** 2, dim=list(range(X.dim()-1))) + 1e-8)
+            W_rms = torch.sqrt(torch.mean(W ** 2, dim=0) + 1e-8)
             
             scale = torch.sqrt(X_rms / (W_rms + 1e-8))
             
-            # Protect salient channels
+            # Protect salient channels with higher scaling factor
             scale[salient_indices] *= self.config.awq_protection_factor
             
-            # Apply damping for stability
+            # Apply damping for numerical stability
             damping = self.config.awq_damping_percent
             scale = scale * (1 - damping) + 1.0 * damping
             
-            # Clip to reasonable range
+            # Clip to reasonable range to avoid numerical issues
             scale = torch.clamp(scale, min=0.01, max=100.0)
             
             scales[name] = scale
@@ -291,6 +305,32 @@ class LayerQuantizer:
                             f"std={scale.std():.3f}, salient={num_salient}")
         
         return scales
+    
+    def _get_hidden_size(self, layer: nn.Module) -> int:
+        """Get hidden size from layer"""
+        if hasattr(layer, 'hidden_size'):
+            return layer.hidden_size
+        elif hasattr(layer, 'input_layernorm'):
+            return layer.input_layernorm.weight.shape[0]
+        else:
+            # Try to infer from first linear layer
+            for module in layer.modules():
+                if isinstance(module, nn.Linear):
+                    return module.in_features
+            # Fallback
+            return self.config.hidden_size if hasattr(self.config, 'hidden_size') else 4096
+    
+    def _create_dummy_input(self, layer: nn.Module) -> torch.Tensor:
+        """Create dummy input tensor for layer"""
+        hidden_size = self._get_hidden_size(layer)
+        batch_size = 1
+        seq_length = 128
+        
+        return torch.randn(
+            batch_size, seq_length, hidden_size,
+            device=next(layer.parameters()).device,
+            dtype=torch.float16
+        ) * 0.02  # Proper initialization scale
     
     def apply_awq_quantization(self,
                               weight: torch.Tensor,

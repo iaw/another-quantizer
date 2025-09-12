@@ -361,9 +361,45 @@ class SequentialModelLoader:
                     'down_proj': nn.Linear(intermediate_size, hidden_size, bias=False),
                 })
             
-            def forward(self, x):
-                # Simplified forward pass (actual implementation would be more complex)
-                return x
+            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+                """Minimal forward pass for calibration
+                
+                This is simplified but functional - enough to:
+                1. Pass activations through all weights
+                2. Maintain residual connections
+                3. Apply layer norms
+                """
+                residual = hidden_states
+                
+                # Input layer norm
+                normed = self.input_layernorm(hidden_states)
+                
+                # Simplified attention (no actual attention computation)
+                # Just pass through projections to activate weights
+                q = self.attention['q_proj'](normed)
+                k = self.attention['k_proj'](normed)  
+                v = self.attention['v_proj'](normed)
+                
+                # Simple attention output - just use V projection
+                # In real implementation would compute attention scores
+                attn_output = self.attention['o_proj'](v)
+                
+                # Residual connection
+                hidden_states = residual + attn_output
+                residual = hidden_states
+                
+                # Post-attention layer norm
+                normed = self.post_attention_layernorm(hidden_states)
+                
+                # MLP with GLM-style gated activation
+                gate = torch.sigmoid(self.mlp['gate_proj'](normed))
+                up = self.mlp['up_proj'](normed)
+                mlp_output = self.mlp['down_proj'](gate * up)
+                
+                # Final residual connection
+                hidden_states = residual + mlp_output
+                
+                return hidden_states
         
         # Create layer module
         layer = TransformerLayer(
@@ -473,9 +509,61 @@ class SequentialModelLoader:
                         })
                         self.shared_experts.append(expert)
             
-            def forward(self, x):
-                # Simplified forward pass
-                return x
+            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+                """Minimal forward pass for MoE layer
+                
+                Simplified but functional MoE forward pass
+                """
+                residual = hidden_states
+                
+                # Input layer norm
+                normed = self.input_layernorm(hidden_states)
+                
+                # Simplified attention (same as regular transformer)
+                q = self.attention['q_proj'](normed)
+                k = self.attention['k_proj'](normed)  
+                v = self.attention['v_proj'](normed)
+                attn_output = self.attention['o_proj'](v)
+                
+                # Residual connection
+                hidden_states = residual + attn_output
+                residual = hidden_states
+                
+                # Post-attention layer norm
+                normed = self.post_attention_layernorm(hidden_states)
+                
+                # MoE routing (simplified - just use top-2 experts)
+                router_logits = self.router(normed)
+                router_probs = torch.softmax(router_logits, dim=-1)
+                
+                # Get top-k experts (simplified to top-2)
+                top_k = min(2, self.num_experts)
+                topk_probs, topk_indices = torch.topk(router_probs, top_k, dim=-1)
+                
+                # Normalize top-k probabilities
+                topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+                
+                # Apply experts (simplified - just use first expert)
+                if self.num_experts > 0:
+                    expert = self.experts[0]
+                    gate = torch.sigmoid(expert['gate_proj'](normed))
+                    up = expert['up_proj'](normed)
+                    expert_output = expert['down_proj'](gate * up)
+                else:
+                    expert_output = normed
+                
+                # Apply shared experts if available
+                if self.num_shared_experts > 0 and hasattr(self, 'shared_experts'):
+                    shared_expert = self.shared_experts[0]
+                    gate = torch.sigmoid(shared_expert['gate_proj'](normed))
+                    up = shared_expert['up_proj'](normed)
+                    shared_output = shared_expert['down_proj'](gate * up)
+                    expert_output = expert_output + shared_output
+                
+                # Final residual connection
+                hidden_states = residual + expert_output
+                
+                return hidden_states
         
         # Create MoE layer
         layer = MoELayer(

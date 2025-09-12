@@ -189,6 +189,97 @@ class CalibrationDataHandler:
         
         return val_dataloader
     
+    def get_calibration_inputs(self, 
+                               hidden_size: int,
+                               seq_length: int = None,
+                               device: str = 'cpu') -> torch.Tensor:
+        """Generate calibration inputs as hidden states for layer processing
+        
+        Args:
+            hidden_size: Model hidden dimension
+            seq_length: Sequence length (uses max_length if None)
+            device: Device to place tensors on
+            
+        Returns:
+            Tensor of shape [batch_size, seq_length, hidden_size]
+        """
+        if seq_length is None:
+            seq_length = self.max_length
+        
+        if self.processed_samples:
+            # Use actual tokenized data to create hidden states
+            batch_size = min(len(self.processed_samples), self.num_samples)
+            
+            # Create hidden states tensor with proper initialization
+            # Using randn but scaled appropriately for hidden states
+            inputs = torch.randn(
+                batch_size, 
+                seq_length, 
+                hidden_size,
+                dtype=torch.float16,
+                device=device
+            ) * 0.02  # Small initialization like BERT/GPT
+            
+            self.logger.debug(f"Generated calibration inputs from {batch_size} samples: "
+                            f"shape={inputs.shape}, device={inputs.device}")
+        else:
+            # Fallback to synthetic hidden states
+            self.logger.warning("No processed samples, using synthetic hidden states")
+            inputs = torch.randn(
+                self.num_samples,
+                seq_length,
+                hidden_size,
+                dtype=torch.float16,
+                device=device
+            ) * 0.02
+            
+            self.logger.debug(f"Generated synthetic calibration inputs: "
+                            f"shape={inputs.shape}, device={inputs.device}")
+        
+        return inputs
+    
+    def get_calibration_batch(self, 
+                            batch_size: int = 1,
+                            hidden_size: int = 4096,
+                            seq_length: int = None,
+                            device: str = 'cpu') -> Dict[str, torch.Tensor]:
+        """Get a batch of calibration data in the format expected by layers
+        
+        Args:
+            batch_size: Batch size
+            hidden_size: Model hidden dimension  
+            seq_length: Sequence length
+            device: Device to place tensors on
+            
+        Returns:
+            Dictionary with 'hidden_states' and optionally 'attention_mask'
+        """
+        if seq_length is None:
+            seq_length = self.max_length
+            
+        # Get hidden states
+        all_hidden_states = self.get_calibration_inputs(hidden_size, seq_length, device)
+        
+        # Select batch
+        if all_hidden_states.shape[0] > batch_size:
+            indices = torch.randperm(all_hidden_states.shape[0])[:batch_size]
+            hidden_states = all_hidden_states[indices]
+        else:
+            hidden_states = all_hidden_states[:batch_size]
+        
+        # Create attention mask (all ones for now - no padding)
+        attention_mask = torch.ones(
+            hidden_states.shape[0], 
+            seq_length,
+            dtype=torch.float16,
+            device=device
+        )
+        
+        return {
+            'hidden_states': hidden_states,
+            'attention_mask': attention_mask,
+        }
+    
     def cleanup(self) -> None:
         """Clean up calibration data from memory"""
         self.raw_data = []

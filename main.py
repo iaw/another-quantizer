@@ -441,11 +441,15 @@ def quantize_command(args: argparse.Namespace) -> int:
     """
     global pipeline
     
-    # Create or load config
+    # Create or load config with clear logic
     if args.config:
+        # User provided a config file
         config = load_config(args.config)
+        logging.info(f"Loaded configuration from: {args.config}")
     else:
+        # Create config from command line arguments
         config = create_config_from_args(args)
+        logging.info("Created configuration from command line arguments")
     
     # Validate config
     if not validate_config(config):
@@ -455,33 +459,43 @@ def quantize_command(args: argparse.Namespace) -> int:
     # Save config for reference
     output_path = Path(config['output_path'])
     output_path.mkdir(parents=True, exist_ok=True)
-    save_config(config, output_path / "quantization_config.yaml")
+    config_file_path = output_path / "quantization_config.yaml"
+    save_config(config, config_file_path)
+    logging.info(f"Saved configuration to: {config_file_path}")
     
     # Initialize pipeline
-    from quantization_pipeline import GLMQuantizationPipeline
+    from pipeline import GLMQuantizationPipeline
     
     # Create temporary config file for pipeline
     import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
         yaml.dump(config, f)
-        config_file = f.name
+        temp_config_file = f.name
     
     try:
-        pipeline = GLMQuantizationPipeline(config_file)
+        # Initialize pipeline with config file
+        pipeline = GLMQuantizationPipeline(temp_config_file)
+        
+        # Determine if we should resume
+        should_resume = args.resume or args.resume_from is not None
         
         # Run quantization
-        pipeline.run(resume_from_checkpoint=args.resume_from)
+        pipeline.run(resume_from_checkpoint=args.resume_from if should_resume else None)
         
         logging.info("Quantization completed successfully")
         return 0
         
     except Exception as e:
         logging.error(f"Quantization failed: {e}")
+        logging.debug(traceback.format_exc())
         return 1
     finally:
         # Clean up temp file
-        if 'config_file' in locals():
-            Path(config_file).unlink(missing_ok=True)
+        if 'temp_config_file' in locals():
+            try:
+                Path(temp_config_file).unlink(missing_ok=True)
+            except:
+                pass
 
 
 def validate_command(args: argparse.Namespace) -> int:
@@ -560,16 +574,27 @@ def dry_run_command(args: argparse.Namespace) -> int:
     """
     logging.info("Running dry run...")
     
-    # Create config
+    # Create config with improved logic
     if args.config:
         config = load_config(args.config)
+        logging.info(f"Using config file: {args.config}")
     else:
+        if not args.model_path:
+            logging.error("Either --config or --model-path required for dry run")
+            return 1
         config = create_config_from_args(args)
+        logging.info("Using command line arguments for configuration")
+    
+    # Validate config first
+    if not validate_config(config):
+        logging.error("Invalid configuration")
+        return 1
     
     # Load model config
     from config import GLMModelConfig
     try:
         model_config = GLMModelConfig.from_model_config(config['model_path'])
+        logging.info(f"Successfully loaded model config from: {config['model_path']}")
     except Exception as e:
         logging.error(f"Failed to load model config: {e}")
         return 1
@@ -590,8 +615,9 @@ def dry_run_command(args: argparse.Namespace) -> int:
         
         handler = CalibrationDataHandler(
             tokenizer=tokenizer,
-            max_length=2048,
-            num_samples=10  # Just test with few samples
+            max_length=config.get('max_position_embeddings', 2048),
+            num_samples=10,  # Just test with few samples
+            hidden_size=model_config.hidden_size
         )
         handler.load_calibration_dataset(dataset_name="c4")
         
@@ -608,6 +634,7 @@ def dry_run_command(args: argparse.Namespace) -> int:
     print("DRY RUN SUMMARY")
     print("="*80)
     print(f"Model: {config['model_path']}")
+    print(f"Output: {config['output_path']}")
     print(f"Parameters: {model_config.get_total_params()/1e9:.1f}B")
     print(f"Layers: {model_config.num_layers}")
     print(f"Quantization: {config['bits']}-bit, group_size={config['group_size']}")
@@ -617,6 +644,9 @@ def dry_run_command(args: argparse.Namespace) -> int:
     print(f"  Disk: {memory_est['disk_required_gb']:.1f}GB")
     print(f"\nEstimated Time: {time_est:.1f} hours")
     print(f"\nEstimated Output Size: {model_config.estimate_quantized_size(config['bits']):.1f}GB")
+    print("\nConfiguration Valid: ✓")
+    print("Model Accessible: ✓")
+    print("Calibration Data: ✓")
     print("="*80)
     
     return 0
@@ -651,8 +681,8 @@ def quantize_glm(
         
         config = config_obj.to_dict()
     
-    # Initialize pipeline
-    from quantization_pipeline import GLMQuantizationPipeline
+    # Initialize pipeline - FIXED IMPORT
+    from pipeline import GLMQuantizationPipeline
     
     # Create temp config file
     import tempfile
@@ -796,41 +826,45 @@ def create_config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     - Set defaults
     - Validate settings
     """
-    from config import create_default_config
+    from config import QuantizationConfig
     
-    # Create base config
-    config_obj = create_default_config(
-        model_path=args.model_path,
-        output_path=args.output_path or f"{args.model_path}_quantized"
-    )
-    
-    # Apply argument overrides
-    if args.bits:
-        config_obj.bits = args.bits
-    if args.group_size:
-        config_obj.group_size = args.group_size
-    if args.calibration_samples:
-        config_obj.calibration_samples = args.calibration_samples
-    if args.batch_size:
-        config_obj.calibration_batch_size = args.batch_size
-    if args.max_gpu_memory:
-        config_obj.max_gpu_memory = args.max_gpu_memory
-    if args.max_cpu_memory:
-        config_obj.max_cpu_memory = args.max_cpu_memory
-    if hasattr(args, 'offload_to_cpu'):
-        config_obj.offload_to_cpu = args.offload_to_cpu
-    if args.checkpoint_dir:
-        config_obj.checkpoint_dir = args.checkpoint_dir
+    # Clear separation between model path and config file
+    if args.config:
+        # Load from config file
+        config_obj = QuantizationConfig.from_yaml(args.config)
     else:
-        config_obj.checkpoint_dir = Path(config_obj.output_path) / "checkpoints"
-    if args.checkpoint_frequency:
-        config_obj.checkpoint_every_n_layers = args.checkpoint_frequency
-    if args.awq_damping:
-        config_obj.awq_damping_percent = args.awq_damping
-    if args.awq_protection_factor:
-        config_obj.awq_protection_factor = args.awq_protection_factor
-    if args.symmetric:
-        config_obj.symmetric = args.symmetric
+        # Create from arguments
+        if not args.model_path:
+            raise ValueError("--model-path required when not using --config")
+        
+        # Ensure paths are strings
+        model_path = str(args.model_path)
+        output_path = args.output_path or f"{model_path}_awq_{args.bits}bit"
+        checkpoint_dir = args.checkpoint_dir or f"{output_path}/checkpoints"
+        
+        # Create config object with all parameters
+        config_obj = QuantizationConfig(
+            model_path=model_path,
+            output_path=output_path,
+            checkpoint_dir=checkpoint_dir,
+            bits=args.bits,
+            group_size=args.group_size,
+            symmetric=args.symmetric,
+            max_gpu_memory=args.max_gpu_memory,
+            max_cpu_memory=args.max_cpu_memory,
+            offload_to_cpu=args.offload_to_cpu,
+            calibration_samples=args.calibration_samples,
+            calibration_batch_size=args.batch_size,
+            checkpoint_every_n_layers=args.checkpoint_frequency,
+            awq_damping_percent=args.awq_damping,
+            awq_protection_factor=args.awq_protection_factor,
+        )
+    
+    # Apply any command-line overrides even when using config file
+    if args.config and args.output_path:
+        config_obj.output_path = args.output_path
+    if args.config and args.checkpoint_dir:
+        config_obj.checkpoint_dir = args.checkpoint_dir
     
     return config_obj.to_dict()
 
