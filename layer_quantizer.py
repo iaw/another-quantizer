@@ -211,18 +211,10 @@ class LayerQuantizer:
         self.metrics_collector = MetricsCollector()
         
     def quantize_layer(self, 
-                       layer: torch.nn.Module, 
-                       layer_name: str,
-                       calibration_data: Any) -> Tuple[torch.nn.Module, LayerQuantizationResult]:
-        """Quantize a single layer using AWQ with error recovery
-        
-        Main entry point for layer quantization:
-        1. Identify layer type and structure
-        2. Compute AWQ scales using calibration data
-        3. Apply quantization to weights
-        4. Pack weights for efficient storage
-        5. Validate and return quantized layer
-        """
+                   layer: torch.nn.Module, 
+                   layer_name: str,
+                   calibration_data: Any) -> Tuple[torch.nn.Module, LayerQuantizationResult]:
+        """Quantize a single layer using AWQ with error recovery"""
         start_time = time.time()
         self.logger.info(f"Starting quantization of layer: {layer_name}")
         
@@ -265,12 +257,28 @@ class LayerQuantizer:
         # Move layer to GPU if needed and possible
         device = self._determine_device(layer, original_size_gb)
         layer = layer.to(device)
-        calibration_data = calibration_data.to(device)
+        
+        # Handle calibration_data properly - FIX HERE
+        if isinstance(calibration_data, dict):
+            # Move dictionary contents to device
+            calibration_data_device = {}
+            for key, value in calibration_data.items():
+                if torch.is_tensor(value):
+                    calibration_data_device[key] = value.to(device)
+                else:
+                    calibration_data_device[key] = value
+            calibration_data = calibration_data_device
+        elif torch.is_tensor(calibration_data):
+            calibration_data = calibration_data.to(device)
+        elif hasattr(calibration_data, 'to'):
+            calibration_data = calibration_data.to(device)
+        # If it's something else, leave as is
         
         # Ensure calibration data is on same device and has proper shape
         if isinstance(calibration_data, dict):
-            calibration_data = calibration_data.get('input_ids', calibration_data)
-        if isinstance(calibration_data, torch.Tensor):
+            # Keep as dict - don't try to extract just input_ids
+            pass
+        elif isinstance(calibration_data, torch.Tensor):
             calibration_data = calibration_data.to(device)
             if calibration_data.dim() == 2:
                 calibration_data = calibration_data.unsqueeze(0)  # Add batch dimension

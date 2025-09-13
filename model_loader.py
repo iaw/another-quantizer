@@ -158,11 +158,16 @@ class SequentialModelLoader:
             layer_type = self._determine_layer_type(layer_name)
             layer_index = self._extract_layer_index(layer_name)
             
-            # Check if it's an MoE layer
-            is_moe = False
-            if layer_index is not None and self.num_experts is not None:
-                # GLM4.5 specific: check if this layer has experts
-                is_moe = any('expert' in w for w in info['weights'])
+            # Check if it's an MoE layer component
+            is_moe = 'experts' in layer_name or 'shared_expert' in layer_name
+            
+            # For MoE experts, mark them specially
+            if 'mlp.experts.' in layer_name:
+                # This is a single expert
+                expert_num = int(re.search(r'experts\.(\d+)', layer_name).group(1))
+                layer_type = 'moe_expert'
+            elif 'shared_expert' in layer_name:
+                layer_type = 'shared_expert'
             
             # Estimate layer size
             size_gb = self._estimate_layer_size(layer_name, info['weights'])
@@ -388,89 +393,77 @@ class SequentialModelLoader:
         return hidden_states
     
     def construct_transformer_layer(self,
-                                   layer_idx: int,
-                                   weights: Dict[str, torch.Tensor]) -> nn.Module:
+                               layer_idx: int,
+                               weights: Dict[str, torch.Tensor]) -> nn.Module:
         """Construct a transformer layer from weights
         
         Returns a proper nn.Module with attention and MLP components
         """
         
         class TransformerLayer(nn.Module):
-            """GLM Transformer layer"""
+            """GLM Transformer layer with GQA support"""
             
-            def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int):
+            def __init__(self, config: Dict[str, Any]):
                 super().__init__()
-                self.hidden_size = hidden_size
-                self.intermediate_size = intermediate_size
-                self.num_heads = num_heads
+                self.hidden_size = config['hidden_size']
+                self.intermediate_size = config.get('intermediate_size', 10944)
+                self.num_heads = config['num_attention_heads']
+                self.num_kv_heads = config.get('num_key_value_heads', self.num_heads)
+                self.head_dim = config.get('head_dim', 128)  # Use explicit head_dim from config
                 
-                # Add input validation
-                assert hidden_size % num_heads == 0, f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
-                self.head_dim = hidden_size // num_heads
+                # For GLM-4, the attention projections have different sizes
+                self.q_size = self.num_heads * self.head_dim  # 96 * 128 = 12,288
+                self.kv_size = self.num_kv_heads * self.head_dim  # 8 * 128 = 1,024
                 
                 # Attention components
-                self.input_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+                self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5)
                 self.attention = nn.ModuleDict({
-                    'q_proj': nn.Linear(hidden_size, hidden_size, bias=False),
-                    'k_proj': nn.Linear(hidden_size, hidden_size, bias=False),
-                    'v_proj': nn.Linear(hidden_size, hidden_size, bias=False),
-                    'o_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                    'q_proj': nn.Linear(self.hidden_size, self.q_size, bias=False),
+                    'k_proj': nn.Linear(self.hidden_size, self.kv_size, bias=False),
+                    'v_proj': nn.Linear(self.hidden_size, self.kv_size, bias=False),
+                    'o_proj': nn.Linear(self.q_size, self.hidden_size, bias=False),
                 })
                 
                 # MLP components
-                self.post_attention_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+                self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5)
                 self.mlp = nn.ModuleDict({
-                    'gate_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
-                    'up_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
-                    'down_proj': nn.Linear(intermediate_size, hidden_size, bias=False),
+                    'gate_proj': nn.Linear(self.hidden_size, self.intermediate_size, bias=False),
+                    'up_proj': nn.Linear(self.hidden_size, self.intermediate_size, bias=False),
+                    'down_proj': nn.Linear(self.intermediate_size, self.hidden_size, bias=False),
                 })
             
             def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-                """Forward pass with simplified but functional attention
-                
-                Computes actual attention scores for realistic activation flow
-                """
-                # Validate and reshape input
-                if hasattr(self, '_parent_loader'):
-                    hidden_states = self._parent_loader._validate_and_reshape_input(hidden_states, self.hidden_size)
-                
-                # Ensure we have proper shape
-                if hidden_states.dim() != 3:
-                    if hidden_states.dim() == 2:
-                        hidden_states = hidden_states.unsqueeze(0)
-                    else:
-                        raise ValueError(f"Expected 3D input, got {hidden_states.dim()}D")
-                
-                batch_size, seq_len, hidden_size = hidden_states.shape
+                """Forward pass with GQA attention"""
+                batch_size, seq_len, _ = hidden_states.shape
                 residual = hidden_states
                 
                 # Input layer norm
                 normed = self.input_layernorm(hidden_states)
                 
-                # Compute Q, K, V projections
-                q = self.attention['q_proj'](normed)
-                k = self.attention['k_proj'](normed)  
-                v = self.attention['v_proj'](normed)
+                # Compute Q, K, V projections with different sizes
+                q = self.attention['q_proj'](normed)  # [batch, seq, 12288]
+                k = self.attention['k_proj'](normed)  # [batch, seq, 1024]
+                v = self.attention['v_proj'](normed)  # [batch, seq, 1024]
                 
                 # Reshape for attention computation
-                # [batch, seq, hidden] -> [batch, heads, seq, head_dim]
-                head_dim = hidden_size // self.num_heads
-                q = q.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
-                k = k.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
-                v = v.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+                q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+                k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
                 
-                # Compute attention scores (simplified - no causal mask)
-                scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
+                # Repeat K,V heads to match Q heads for GQA
+                if self.num_kv_heads < self.num_heads:
+                    repeat_factor = self.num_heads // self.num_kv_heads
+                    k = k.repeat_interleave(repeat_factor, dim=1)
+                    v = v.repeat_interleave(repeat_factor, dim=1)
                 
-                # Apply softmax to get attention weights
+                # Compute attention scores
+                scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
                 attn_weights = torch.softmax(scores, dim=-1)
-                
-                # Apply attention to values
                 attn_output = torch.matmul(attn_weights, v)
                 
-                # Reshape back to [batch, seq, hidden]
+                # Reshape back
                 attn_output = attn_output.transpose(1, 2).contiguous().view(
-                    batch_size, seq_len, hidden_size
+                    batch_size, seq_len, self.q_size
                 )
                 
                 # Output projection
@@ -483,10 +476,9 @@ class SequentialModelLoader:
                 # Post-attention layer norm
                 normed = self.post_attention_layernorm(hidden_states)
                 
-                # MLP with GLM-style gated activation (SwiGLU)
+                # MLP with SwiGLU activation
                 gate = self.mlp['gate_proj'](normed)
                 up = self.mlp['up_proj'](normed)
-                # Use SiLU (Swish) activation for gate as in GLM
                 gate = gate * torch.sigmoid(gate)
                 mlp_output = self.mlp['down_proj'](gate * up)
                 
@@ -495,17 +487,13 @@ class SequentialModelLoader:
                 
                 return hidden_states
         
-        # Create layer module
-        layer = TransformerLayer(
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            num_heads=self.num_attention_heads
-        )
+        # Create layer module with actual config
+        layer = TransformerLayer(self.config)
         
         # Store layer name for reference
         layer._layer_name = f"transformer.layers.{layer_idx}"
         
-        # Load weights into the module
+        # Load weights into the module (rest remains the same)
         for weight_name, weight_tensor in weights.items():
             # Validate tensor
             if weight_tensor is None:
@@ -554,28 +542,27 @@ class SequentialModelLoader:
         return layer
     
     def construct_moe_layer(self,
-                          layer_idx: int,
-                          weights: Dict[str, torch.Tensor]) -> nn.Module:
-        """Construct an MoE layer from weights
-        
-        Returns a proper nn.Module with router and experts
-        """
+                      layer_idx: int,
+                      weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Construct an MoE layer from weights"""
         
         class MoELayer(nn.Module):
             """GLM MoE layer"""
             
-            def __init__(self, hidden_size: int, intermediate_size: int, 
-                        num_experts: int, num_shared_experts: int, num_heads: int):
+            def __init__(self, config: Dict[str, Any]):
                 super().__init__()
-                self.hidden_size = hidden_size
-                self.intermediate_size = intermediate_size
-                self.num_experts = num_experts
-                self.num_shared_experts = num_shared_experts
-                self.num_heads = num_heads
+                self.hidden_size = config['hidden_size']
+                self.moe_intermediate_size = config.get('moe_intermediate_size', 1408)
+                self.num_experts = config.get('n_routed_experts', 128)
+                self.num_shared_experts = config.get('n_shared_experts', 1)
+                self.num_experts_per_tok = config.get('num_experts_per_tok', 8)
+                self.num_heads = config['num_attention_heads']
+                self.num_kv_heads = config.get('num_key_value_heads', self.num_heads)
+                self.head_dim = config.get('head_dim', 128)
                 
-                # Add input validation
-                assert hidden_size % num_heads == 0, f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
-                self.head_dim = hidden_size // num_heads
+                # Attention sizes
+                self.q_size = self.num_heads * self.head_dim
+                self.kv_size = self.num_kv_heads * self.head_dim
                 assert num_experts > 0, f"num_experts must be positive, got {num_experts}"
                 
                 # Attention components (same as transformer)
@@ -1036,13 +1023,29 @@ class SequentialModelLoader:
     
     def _extract_layer_name(self, weight_name: str) -> str:
         """Extract layer name from weight name"""
-        # GLM4.5 patterns
+        
+        # For MoE layers, treat each expert as a separate "layer" for memory efficiency
+        if 'mlp.experts.' in weight_name:
+            # Extract up to the expert number: model.layers.N.mlp.experts.M
+            match = re.search(r'(model\.layers\.\d+\.mlp\.experts\.\d+)', weight_name)
+            if match:
+                return match.group(1)
+        
+        # For shared experts
+        if 'mlp.shared_expert' in weight_name:
+            match = re.search(r'(model\.layers\.\d+\.mlp\.shared_expert)', weight_name)
+            if match:
+                return match.group(1)
+        
+        # For non-MoE layers (attention, layer norms), group them together
         patterns = [
-            r'(transformer\.embedding)',
-            r'(transformer\.layers\.\d+)',
-            r'(transformer\.final_layernorm)',
-            r'(lm_head)',
-            r'(output_layer)',
+            r'(model\.embed_tokens)',           # Embedding
+            r'(model\.layers\.\d+\.self_attn)', # Attention as a unit
+            r'(model\.layers\.\d+\.mlp)(?!\.experts)',  # MLP but not experts
+            r'(model\.layers\.\d+\.input_layernorm)',   # Layer norms
+            r'(model\.layers\.\d+\.post_attention_layernorm)',
+            r'(model\.norm)',                   # Final norm
+            r'(lm_head)',                      # Output head
         ]
         
         for pattern in patterns:
@@ -1050,11 +1053,7 @@ class SequentialModelLoader:
             if match:
                 return match.group(1)
         
-        # Fallback: use everything before the last dot
-        parts = weight_name.rsplit('.', 2)
-        if len(parts) > 2:
-            return parts[0]
-        
+        # Fallback
         return weight_name
     
     def _extract_layer_index(self, layer_name: str) -> Optional[int]:
@@ -1082,30 +1081,42 @@ class SequentialModelLoader:
         """Estimate layer size in GB"""
         total_params = 0
         
-        # Estimate based on weight names and expected shapes
+        # Get actual sizes from weight tensors if available
         for weight_name in weight_names:
-            if 'q_proj' in weight_name or 'k_proj' in weight_name or 'v_proj' in weight_name or 'o_proj' in weight_name:
-                # Attention weights
-                total_params += self.hidden_size * self.hidden_size
+            # Check for specific components
+            if 'experts.' in weight_name and 'mlp.experts.' in layer_name:
+                # Single expert size (not all 128!)
+                # Each expert has gate, up, down projections
+                if 'gate' in weight_name or 'up' in weight_name:
+                    # hidden_size -> moe_intermediate_size
+                    total_params += self.hidden_size * self.config.get('moe_intermediate_size', 1408)
+                elif 'down' in weight_name:
+                    # moe_intermediate_size -> hidden_size
+                    total_params += self.config.get('moe_intermediate_size', 1408) * self.hidden_size
+            elif 'shared_expert' in weight_name:
+                # Shared expert (larger than regular experts)
+                if 'gate' in weight_name or 'up' in weight_name:
+                    total_params += self.hidden_size * self.intermediate_size
+                elif 'down' in weight_name:
+                    total_params += self.intermediate_size * self.hidden_size
+            elif any(x in weight_name for x in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
+                # Attention weights - use actual sizes from config
+                if 'q_proj' in weight_name:
+                    total_params += self.hidden_size * (self.num_attention_heads * self.config.get('head_dim', 128))
+                elif 'k_proj' in weight_name or 'v_proj' in weight_name:
+                    total_params += self.hidden_size * (self.config.get('num_key_value_heads', 8) * self.config.get('head_dim', 128))
+                elif 'o_proj' in weight_name:
+                    total_params += (self.num_attention_heads * self.config.get('head_dim', 128)) * self.hidden_size
             elif 'gate_proj' in weight_name or 'up_proj' in weight_name:
                 total_params += self.hidden_size * self.intermediate_size
             elif 'down_proj' in weight_name:
                 total_params += self.intermediate_size * self.hidden_size
-            elif 'expert' in weight_name and self.num_experts:
-                # MoE expert weights
-                if 'gate' in weight_name or 'up' in weight_name:
-                    total_params += self.hidden_size * self.intermediate_size
-                else:
-                    total_params += self.intermediate_size * self.hidden_size
-            elif 'embedding' in weight_name:
-                total_params += self.vocab_size * self.hidden_size
-            elif 'lm_head' in weight_name:
-                total_params += self.vocab_size * self.hidden_size
             elif 'norm' in weight_name:
                 total_params += self.hidden_size * 2  # weight and bias
         
-        # Convert to GB (assuming FP16)
-        size_gb = (total_params * 2) / 1e9
+        # Convert to GB (assuming BF16 from config)
+        dtype_size = 2  # BF16 = 2 bytes
+        size_gb = (total_params * dtype_size) / 1e9
         
         return size_gb
     
@@ -1129,25 +1140,54 @@ class SequentialModelLoader:
         
         # 1. Embedding layers first
         for name in layer_names:
-            if 'embedding' in name.lower():
+            if 'embed' in name.lower():
                 sorted_layers.append(name)
         
-        # 2. Transformer layers in order
-        transformer_layers = []
+        # 2. Process each transformer layer completely
+        layer_indices = set()
         for name in layer_names:
-            if 'layers' in name:
-                transformer_layers.append(name)
+            match = re.search(r'layers\.(\d+)', name)
+            if match:
+                layer_indices.add(int(match.group(1)))
         
-        # Sort by layer index
-        transformer_layers.sort(key=lambda x: self._extract_layer_index(x) or 0)
-        sorted_layers.extend(transformer_layers)
+        for idx in sorted(layer_indices):
+            # For each layer, process in order:
+            # a. Layer norm
+            for name in layer_names:
+                if f'layers.{idx}.input_layernorm' in name:
+                    sorted_layers.append(name)
+            
+            # b. Self attention
+            for name in layer_names:
+                if f'layers.{idx}.self_attn' in name and name not in sorted_layers:
+                    sorted_layers.append(name)
+            
+            # c. Post attention layer norm
+            for name in layer_names:
+                if f'layers.{idx}.post_attention_layernorm' in name:
+                    sorted_layers.append(name)
+            
+            # d. Shared expert (if exists)
+            for name in layer_names:
+                if f'layers.{idx}.mlp.shared_expert' in name and name not in sorted_layers:
+                    sorted_layers.append(name)
+            
+            # e. Individual experts (process one by one)
+            expert_layers = [n for n in layer_names if f'layers.{idx}.mlp.experts.' in n]
+            expert_layers.sort(key=lambda x: int(re.search(r'experts\.(\d+)', x).group(1)))
+            sorted_layers.extend(expert_layers)
+            
+            # f. Other MLP components
+            for name in layer_names:
+                if f'layers.{idx}.mlp' in name and 'expert' not in name and name not in sorted_layers:
+                    sorted_layers.append(name)
         
         # 3. Final layer norm
         for name in layer_names:
-            if 'final' in name or ('layernorm' in name and 'layers' not in name):
+            if 'norm' in name.lower() and 'layers' not in name:
                 sorted_layers.append(name)
         
-        # 4. Output head last
+        # 4. Output head
         for name in layer_names:
             if 'lm_head' in name or 'output' in name:
                 sorted_layers.append(name)

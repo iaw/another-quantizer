@@ -266,7 +266,7 @@ class CalibrationDataHandler:
             return False
     
     def prepare_calibration_data(self, 
-                                batch_size: int = 2) -> DataLoader:
+                            batch_size: int = 2) -> DataLoader:
         """Prepare calibration data loader - SIMPLIFIED"""
         if not self.raw_data:
             self.logger.warning("No raw data loaded, generating synthetic data")
@@ -292,6 +292,18 @@ class CalibrationDataHandler:
             )
             self.processed_samples.append(sample)
         
+        # Define custom collate function to handle CalibrationSample
+        def collate_fn(batch):
+            """Custom collate function for CalibrationSample"""
+            input_ids = torch.stack([sample.input_ids for sample in batch])
+            attention_mask = torch.stack([sample.attention_mask for sample in batch])
+            
+            # Return a single CalibrationSample with batched tensors
+            return CalibrationSample(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+        
         # Create dataset and dataloader
         dataset = CalibrationDataset(self.processed_samples)
         dataloader = DataLoader(
@@ -299,7 +311,8 @@ class CalibrationDataHandler:
             batch_size=batch_size,
             shuffle=False,  # No shuffle for reproducibility
             num_workers=0,
-            pin_memory=torch.cuda.is_available()
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=collate_fn  # ADD THIS LINE
         )
         
         self.logger.info(f"Created dataloader with {len(dataloader)} batches")

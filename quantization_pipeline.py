@@ -289,6 +289,17 @@ class GLMQuantizationPipeline:
         # Get calibration data
         calibration_batch = next(iter(self.calibration_dataloader))
         
+        # Handle both dict and CalibrationSample formats
+        if isinstance(calibration_batch, dict):
+            # It's already a dict, use as-is
+            pass
+        elif hasattr(calibration_batch, 'input_ids'):
+            # It's a CalibrationSample, convert to dict
+            calibration_batch = {
+                'input_ids': calibration_batch.input_ids,
+                'attention_mask': calibration_batch.attention_mask
+            }
+        
         # Process each layer
         for layer_name, layer_module in self.model_loader.iterate_layers():
             # Skip if already completed
@@ -378,7 +389,19 @@ class GLMQuantizationPipeline:
                             self.memory_manager.emergency_cleanup(required_memory_gb=estimated_size)
                             
                             # Reduce batch size for next attempt
-                            if hasattr(calibration_batch, 'input_ids'):
+                            if isinstance(calibration_batch, dict):
+                                # Handle dictionary format
+                                if 'input_ids' in calibration_batch:
+                                    batch_size = calibration_batch['input_ids'].shape[0]
+                                    if batch_size > 1:
+                                        calibration_batch = {
+                                            'input_ids': calibration_batch['input_ids'][:batch_size//2],
+                                            'attention_mask': calibration_batch.get('attention_mask', 
+                                                torch.ones_like(calibration_batch['input_ids']))[:batch_size//2]
+                                        }
+                                        self.logger.info(f"Reduced batch size to {batch_size//2}")
+                            elif hasattr(calibration_batch, 'input_ids'):
+                                # Handle CalibrationSample format
                                 batch_size = calibration_batch.input_ids.shape[0]
                                 if batch_size > 1:
                                     calibration_batch = type(calibration_batch)(
@@ -396,7 +419,19 @@ class GLMQuantizationPipeline:
                             retry_count += 1
                             self.logger.warning(f"Error on GPU, retrying on CPU: {e}")
                             layer_module = layer_module.to('cpu')
-                            calibration_batch = calibration_batch.to('cpu') if hasattr(calibration_batch, 'to') else calibration_batch
+                            
+                            # Handle calibration_batch properly when moving to CPU
+                            if isinstance(calibration_batch, dict):
+                                # Move dictionary tensors to CPU
+                                calibration_batch = {
+                                    k: v.to('cpu') if torch.is_tensor(v) else v 
+                                    for k, v in calibration_batch.items()
+                                }
+                            elif torch.is_tensor(calibration_batch):
+                                calibration_batch = calibration_batch.to('cpu')
+                            elif hasattr(calibration_batch, 'to'):
+                                calibration_batch = calibration_batch.to('cpu')
+                            # If it's something else, leave it as is
                         else:
                             raise LayerQuantizationError(layer_name, e)
                 
