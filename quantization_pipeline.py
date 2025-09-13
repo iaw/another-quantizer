@@ -66,11 +66,12 @@ class QuantizationMetrics:
     """Metrics for quantization quality and performance"""
     layer_name: str
     quantization_time: float
-    memory_peak_gb: float
+    memory_peak_gb: float  # Make sure this has NO default value
     mse_error: float
     cosine_similarity: float
     compression_ratio: float
     weights_size_mb: float
+    # NO fields with defaults should come after fields without defaults
     
 
 class GLMQuantizationPipeline:

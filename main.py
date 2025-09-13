@@ -16,6 +16,15 @@ import signal
 import traceback
 import warnings
 
+# In main.py, add this import after the other imports (around line 20-30)
+from quantization_pipeline import (
+    GLMQuantizationPipeline,
+    CalibrationError,
+    CheckpointError, 
+    LayerQuantizationError,
+    MemoryError as QuantizationMemoryError  # Rename to avoid conflict with Python's MemoryError
+)
+
 # Suppress some warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
@@ -481,6 +490,8 @@ def quantize_command(args: argparse.Namespace) -> int:
         
         # Run quantization with error recovery
         try:
+            should_resume = args.resume or args.resume_from is not None
+            resume_checkpoint = args.resume_from if args.resume_from else (True if args.resume else None)
             pipeline.run(resume_from_checkpoint=resume_checkpoint)
             logging.info("Quantization completed successfully")
             return 0

@@ -12,33 +12,53 @@ import numpy as np
 import gc
 import re
 
-# LLM Compressor imports - with fallback support
+# Try both possible import paths
+# At the top of llm_compressor_wrapper.py, replace the import section:
+
 LLM_COMPRESSOR_AVAILABLE = False
 AWQModifier = None
 oneshot = None
 create_mapping = None
 
 try:
-    from llmcompressor.modifiers.quantization import AWQModifier
-    from llmcompressor.transformers import oneshot
-    from llmcompressor.modifiers.quantization.utils import create_mapping
-    LLM_COMPRESSOR_AVAILABLE = True
+    # Check what's actually available in llmcompressor
+    import llmcompressor
+    
+    # Try to find AWQ in the quantization submodule
+    try:
+        from llmcompressor.modifiers.quantization.awq import AWQModifier
+        LLM_COMPRESSOR_AVAILABLE = True
+    except ImportError:
+        try:
+            from llmcompressor.quantization import AWQModifier
+            LLM_COMPRESSOR_AVAILABLE = True
+        except ImportError:
+            # AWQ might not be available in this version
+            pass
+    
+    # Try to import other components
+    if LLM_COMPRESSOR_AVAILABLE:
+        try:
+            from llmcompressor.transformers import oneshot
+        except ImportError:
+            try:
+                from llmcompressor import oneshot
+            except ImportError:
+                oneshot = None
+                
 except ImportError as e:
     warning_msg = (
         "\n" + "="*80 + "\n"
-        "WARNING: LLM Compressor is not installed!\n"
+        "WARNING: LLM Compressor is not installed or cannot be imported!\n"
+        f"Import error: {e}\n"
         "\n"
         "Running in fallback mode with basic AWQ implementation.\n"
-        "For better performance and compatibility, install LLM Compressor:\n"
-        "\n"
-        "  pip install llmcompressor\n"
-        "\n"
-        "For more information, visit: https://github.com/vllm-project/llm-compressor\n"
+        "This is fine - the fallback implementation will work!\n"
         + "="*80 + "\n"
     )
     print(warning_msg)
     import logging
-    logging.getLogger(__name__).warning("LLM Compressor not available, using fallback implementation")
+    logging.getLogger(__name__).warning(f"LLM Compressor not available: {e}")
 
 
 @dataclass

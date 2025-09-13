@@ -18,37 +18,30 @@ from datetime import datetime
 @dataclass
 class LayerMetrics:
     """Metrics for a single layer"""
+    # ALL fields without defaults MUST come first
     layer_name: str
     layer_type: str
     quantization_time: float
     original_size_mb: float
     quantized_size_mb: float
     compression_ratio: float
-    
-    # Error metrics
     mse_error: float
     cosine_similarity: float
     max_abs_error: float
     relative_error: float
-    
-    # Weight statistics
     weight_mean: float
     weight_std: float
     weight_min: float
     weight_max: float
     weight_sparsity: float
-    
-    # Scale statistics
     scale_mean: float
     scale_std: float
     scale_min: float
     scale_max: float
+    peak_gpu_memory_mb: float  # NO DEFAULT VALUE
+    peak_cpu_memory_mb: float   # NO DEFAULT VALUE
     
-    # Memory usage
-    peak_gpu_memory_mb: float
-    peak_cpu_memory_mb: float
-    
-    # Activation statistics (if available)
+    # ALL fields with defaults MUST come last
     activation_mean: Optional[float] = None
     activation_std: Optional[float] = None
     activation_range: Optional[Tuple[float, float]] = None
@@ -74,13 +67,15 @@ class ModelMetrics:
     average_mse_error: float
     average_cosine_similarity: float
     max_layer_error: float
-    perplexity: Optional[float] = None
+    
     
     # Memory metrics
     peak_gpu_memory_gb: float
     peak_cpu_memory_gb: float
     average_gpu_memory_gb: float
     
+    # Last quality metric
+    perplexity: Optional[float] = None
     # Method info
     quantization_method: str = "awq"
     bits: int = 4

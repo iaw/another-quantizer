@@ -2,7 +2,7 @@
 """Handle calibration data for quantization"""
 
 import torch
-from typing import List, Iterator, Optional, Dict, Any, Tuple
+from typing import List, Iterator, Optional, Dict, Any, Tuple, Union
 from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
 import json
@@ -16,6 +16,12 @@ import hashlib
 import pickle
 import gc
 
+
+
+# Add this exception class definition
+class CalibrationError(Exception):
+    """Exception raised for calibration data errors"""
+    pass
 
 @dataclass
 class CalibrationSample:
@@ -67,10 +73,10 @@ class CalibrationDataHandler:
         self.processed_samples = []
         
     def load_calibration_dataset(self, 
-                                dataset_name: str = "c4",
-                                subset: Optional[str] = "en",
-                                split: str = "train",
-                                custom_path: Optional[str] = None) -> None:
+                            dataset_name: str = "c4",
+                            subset: Optional[str] = "en",
+                            split: str = "train",
+                            custom_path: Optional[str] = None) -> None:
         """Load calibration dataset from HuggingFace or custom source
         
         Supports c4, wikitext, pile, and custom datasets
@@ -91,47 +97,84 @@ class CalibrationDataHandler:
         try:
             from datasets import load_dataset
             
-            # Configure dataset parameters
-            dataset_configs = {
-                "c4": {"path": "c4", "subset": subset or "en", "split": f"{split}[:1000]"},
-                "wikitext": {"path": "wikitext", "subset": "wikitext-103-v1", "split": split},
-                "pile": {"path": "EleutherAI/pile", "subset": subset, "split": f"{split}[:1000]"},
-                "openwebtext": {"path": "Skylion007/openwebtext", "subset": None, "split": f"{split}[:1000]"},
-            }
-            
-            if dataset_name in dataset_configs:
-                config = dataset_configs[dataset_name]
-                self.logger.info(f"Loading {dataset_name} from HuggingFace...")
+            # Configure dataset parameters - UPDATED SECTION
+            if dataset_name == "c4":
+                # C4 needs special handling - no slice notation in split
+                self.logger.info(f"Loading c4 from HuggingFace...")
+                dataset = load_dataset(
+                    "allenai/c4", 
+                    subset or "en",
+                    split=split,  # Use plain split without slicing
+                    streaming=True,  # Use streaming to avoid loading entire dataset
+                    trust_remote_code=False
+                )
                 
-                # Load dataset
-                if config["subset"]:
-                    dataset = load_dataset(config["path"], config["subset"], split=config["split"], streaming=True)
-                else:
-                    dataset = load_dataset(config["path"], split=config["split"], streaming=True)
-                
-                # Extract text samples
+                # Extract text samples with streaming
                 self.raw_data = []
-                text_field = "text" if "text" in next(iter(dataset)).keys() else "content"
-                
                 for i, sample in enumerate(dataset):
                     if i >= self.num_samples * 2:  # Load 2x samples for variety
                         break
-                    text = sample.get(text_field, "")
+                    text = sample.get('text', '')
                     if text and len(text) > 100:  # Filter very short texts
                         self.raw_data.append(text)
-                
-                if len(self.raw_data) < self.num_samples:
-                    self.logger.warning(f"Only loaded {len(self.raw_data)} samples, generating additional synthetic data")
-                    self._generate_synthetic_data()
-                
-                self.logger.info(f"Loaded {len(self.raw_data)} samples from {dataset_name}")
+                        
+            elif dataset_name == "wikitext":
+                self.logger.info(f"Loading wikitext from HuggingFace...")
+                dataset = load_dataset(
+                    "wikitext",
+                    "wikitext-103-v1",
+                    split=split
+                )
+                self.raw_data = []
+                for i, sample in enumerate(dataset):
+                    if i >= self.num_samples * 2:
+                        break
+                    text = sample.get('text', '')
+                    if text and len(text) > 100:
+                        self.raw_data.append(text)
+                        
+            elif dataset_name == "pile":
+                self.logger.info(f"Loading pile from HuggingFace...")
+                dataset = load_dataset(
+                    "EleutherAI/pile",
+                    subset,
+                    split=split,
+                    streaming=True
+                )
+                self.raw_data = []
+                for i, sample in enumerate(dataset):
+                    if i >= self.num_samples * 2:
+                        break
+                    text = sample.get('text', sample.get('content', ''))
+                    if text and len(text) > 100:
+                        self.raw_data.append(text)
+                        
+            elif dataset_name == "openwebtext":
+                self.logger.info(f"Loading openwebtext from HuggingFace...")
+                dataset = load_dataset(
+                    "Skylion007/openwebtext",
+                    split=split,
+                    streaming=True
+                )
+                self.raw_data = []
+                for i, sample in enumerate(dataset):
+                    if i >= self.num_samples * 2:
+                        break
+                    text = sample.get('text', '')
+                    if text and len(text) > 100:
+                        self.raw_data.append(text)
             else:
                 raise ValueError(f"Unknown dataset: {dataset_name}")
+            
+            if len(self.raw_data) < self.num_samples:
+                self.logger.warning(f"Only loaded {len(self.raw_data)} samples, generating additional synthetic data")
+                self._generate_synthetic_data()
+            
+            self.logger.info(f"Loaded {len(self.raw_data)} samples from {dataset_name}")
                 
         except ImportError as e:
             self.logger.warning("datasets library not installed, using synthetic data")
             self.logger.info("Install with: pip install datasets")
-            self.logger.info("Or install with: pip install datasets transformers")
             self._generate_synthetic_data()
             
         except ConnectionError as e:
@@ -141,7 +184,7 @@ class CalibrationDataHandler:
             
         except ValueError as e:
             self.logger.error(f"Invalid dataset configuration: {e}")
-            self.logger.info(f"Available datasets: {list(dataset_configs.keys())}")
+            self.logger.info(f"Available datasets: c4, wikitext, pile, openwebtext")
             raise CalibrationError(f"Invalid dataset: {dataset_name}") from e
             
         except Exception as e:
