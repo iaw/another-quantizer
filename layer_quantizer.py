@@ -181,10 +181,11 @@ class AWQScalePropagator:
 class LayerQuantizer:
     """Handles quantization of individual layers"""
     
-    def __init__(self, config: Any, memory_manager: Any):
+    def __init__(self, config: Any, memory_manager: Any, model_loader: Any = None):
         """Initialize layer quantizer"""
         self.config = config
         self.memory_manager = memory_manager
+        self.model_loader = model_loader  # Reference to model loader for dtype info
         self.awq_scales = {}  # Cache scales across layers
         self.quantization_cache = {}  # Cache for reuse
         self.logger = logging.getLogger(__name__)
@@ -314,16 +315,33 @@ class LayerQuantizer:
         device = self._determine_device(layer, original_size_gb)
         layer = layer.to(device)
         
-        # Handle calibration_data device placement - with validation
-        self.logger.debug(f"Moving calibration data to device: {device}")
+        # Detect layer's expected dtype - prefer model loader info if available
+        if self.model_loader is not None:
+            layer_dtype = self.model_loader.get_layer_dtype(layer_name)
+            self.logger.debug(f"Layer {layer_name} expects dtype from model_loader: {layer_dtype}")
+        else:
+            # Fallback to checking layer parameters
+            layer_dtype = next(layer.parameters()).dtype
+            self.logger.debug(f"Layer {layer_name} expects dtype from parameters: {layer_dtype}")
+        
+        # Handle calibration_data device placement AND dtype conversion
+        self.logger.debug(f"Moving calibration data to device: {device} with dtype: {layer_dtype}")
         
         if isinstance(calibration_data, dict):
-            # Move dictionary contents to device
+            # Move dictionary contents to device AND convert dtype for float tensors
             calibration_data_device = {}
             for key, value in calibration_data.items():
                 if torch.is_tensor(value):
-                    calibration_data_device[key] = value.to(device)
-                    self.logger.debug(f"Moved {key} tensor to {device}: shape={value.shape}")
+                    # Move to device
+                    moved_tensor = value.to(device)
+                    
+                    # Convert dtype only for floating point tensors (not for int input_ids)
+                    if moved_tensor.dtype.is_floating_point and moved_tensor.dtype != layer_dtype:
+                        self.logger.debug(f"Converting {key} from {moved_tensor.dtype} to {layer_dtype}")
+                        moved_tensor = moved_tensor.to(dtype=layer_dtype)
+                    
+                    calibration_data_device[key] = moved_tensor
+                    self.logger.debug(f"Moved {key} tensor to {device}: shape={moved_tensor.shape}, dtype={moved_tensor.dtype}")
                 else:
                     calibration_data_device[key] = value
                     self.logger.debug(f"Kept {key} as-is: type={type(value)}")
@@ -614,8 +632,11 @@ class LayerQuantizer:
                     elif layer_name in self.activation_cache:
                         hidden_states = self.activation_cache[layer_name]
                     else:
-                        # Generate synthetic hidden states as fallback
+                        # Generate synthetic hidden states as fallback - with correct dtype
                         hidden_size = self._get_hidden_size(layer)
+                        # Get layer's expected dtype
+                        layer_dtype = next(layer.parameters()).dtype
+                        
                         input_ids = calibration_data['input_ids']
                         if isinstance(input_ids, torch.Tensor):
                             batch_size = input_ids.shape[0] if input_ids.dim() > 0 else 1
@@ -627,7 +648,7 @@ class LayerQuantizer:
                         hidden_states = torch.randn(
                             batch_size, seq_len, hidden_size, 
                             device=layer.device, 
-                            dtype=torch.float16
+                            dtype=layer_dtype  # Use layer's dtype
                         ) * 0.02
                         self.logger.debug(f"Generated synthetic hidden states for {layer_name}: shape={hidden_states.shape}")
             elif hasattr(calibration_data, 'input_ids'):
@@ -1119,15 +1140,21 @@ class LayerQuantizer:
             return self.config.hidden_size if hasattr(self.config, 'hidden_size') else 4096
     
     def _create_dummy_input(self, layer: nn.Module) -> torch.Tensor:
-        """Create dummy input tensor for layer"""
+        """Create dummy input tensor for layer with correct dtype"""
         hidden_size = self._get_hidden_size(layer)
         batch_size = 1
         seq_length = 128
         
+        # Get the layer's expected dtype from its parameters
+        layer_dtype = next(layer.parameters()).dtype
+        layer_device = next(layer.parameters()).device
+        
+        self.logger.debug(f"Creating dummy input with dtype={layer_dtype}, device={layer_device}")
+        
         return torch.randn(
             batch_size, seq_length, hidden_size,
-            device=next(layer.parameters()).device,
-            dtype=torch.float16
+            device=layer_device,
+            dtype=layer_dtype  # Use layer's dtype, not hardcoded float16
         ) * 0.02  # Proper initialization scale
     
     def apply_awq_quantization(self,

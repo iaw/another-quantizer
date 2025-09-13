@@ -184,7 +184,7 @@ class GLMQuantizationPipeline:
                 trust_remote_code=True
             )
             
-            # Setup Calibration Data
+            # Setup Calibration Data with model dtype
             self.logger.info("Preparing calibration data...")
             from calibration_data import CalibrationDataHandler
             self.calibration_handler = CalibrationDataHandler(
@@ -194,16 +194,23 @@ class GLMQuantizationPipeline:
                 hidden_size=hidden_size
             )
             self.calibration_handler.load_calibration_dataset()
+            
+            # Use model's detected dtype for calibration data
+            model_dtype = self.model_loader.model_dtype if self.model_loader.model_dtype else torch.float16
+            self.logger.info(f"Preparing calibration data with model dtype: {model_dtype}")
+            
             self.calibration_dataloader = self.calibration_handler.prepare_calibration_data(
-                batch_size=self.config.calibration_batch_size
+                batch_size=self.config.calibration_batch_size,
+                dtype=model_dtype  # Pass model dtype
             )
             
-            # Initialize Layer Quantizer
+            # Initialize Layer Quantizer with model_loader for dtype info
             self.logger.info("Initializing quantizer...")
             from layer_quantizer import LayerQuantizer
             self.layer_quantizer = LayerQuantizer(
                 config=self.config,
-                memory_manager=self.memory_manager
+                memory_manager=self.memory_manager,
+                model_loader=self.model_loader  # Pass model loader for dtype detection
             )
             
             # Setup Checkpoint Manager
@@ -286,23 +293,48 @@ class GLMQuantizationPipeline:
             unit="layer"
         )
         
-        # Get calibration data - store it properly
+        # Get calibration data - store it properly with DEEP COPYING
         calibration_batch = next(iter(self.calibration_dataloader))
         
-        # Handle both dict and CalibrationSample formats - make a proper copy
+        # Create immutable original copy with proper type handling
+        self.logger.debug(f"[PIPELINE] Initial calibration_batch type: {type(calibration_batch)}")
+        
         if isinstance(calibration_batch, dict):
-            # It's already a dict, make a copy to preserve original
-            original_calibration_batch = {k: v.clone() if torch.is_tensor(v) else v 
-                                        for k, v in calibration_batch.items()}
+            # Deep copy dictionary to preserve original
+            original_calibration_batch = {}
+            for k, v in calibration_batch.items():
+                if torch.is_tensor(v):
+                    original_calibration_batch[k] = v.clone().detach()
+                    self.logger.debug(f"[PIPELINE] Cloned tensor {k}: shape={v.shape}, dtype={v.dtype}")
+                elif v is None:
+                    original_calibration_batch[k] = None
+                else:
+                    original_calibration_batch[k] = v
+                    self.logger.warning(f"[PIPELINE] Non-tensor value for {k}: type={type(v)}")
+                    
         elif hasattr(calibration_batch, 'input_ids'):
-            # It's a CalibrationSample, convert to dict
+            # It's a CalibrationSample, convert to dict safely
             original_calibration_batch = {
-                'input_ids': calibration_batch.input_ids.clone(),
-                'attention_mask': calibration_batch.attention_mask.clone() if hasattr(calibration_batch, 'attention_mask') else None
+                'input_ids': calibration_batch.input_ids.clone().detach(),
+                'attention_mask': calibration_batch.attention_mask.clone().detach() 
+                                if hasattr(calibration_batch, 'attention_mask') and calibration_batch.attention_mask is not None
+                                else None
             }
+            self.logger.debug(f"[PIPELINE] Converted CalibrationSample to dict with keys: {list(original_calibration_batch.keys())}")
+            
+        elif torch.is_tensor(calibration_batch):
+            # Single tensor
+            original_calibration_batch = calibration_batch.clone().detach()
+            self.logger.debug(f"[PIPELINE] Cloned single tensor: shape={original_calibration_batch.shape}")
         else:
-            # Assume it's a tensor
-            original_calibration_batch = calibration_batch.clone() if torch.is_tensor(calibration_batch) else calibration_batch
+            # Unknown type - log error but try to continue
+            self.logger.error(f"[PIPELINE] Unknown calibration_batch type: {type(calibration_batch)}")
+            original_calibration_batch = calibration_batch
+        
+        # Validate the original is properly set
+        if isinstance(original_calibration_batch, str):
+            self.logger.error(f"[PIPELINE] CRITICAL: original_calibration_batch is string: '{original_calibration_batch}'")
+            raise ValueError("Calibration data corrupted to string at initialization")
         
         # Process each layer
         for layer_name, layer_module in self.model_loader.iterate_layers():
@@ -348,30 +380,92 @@ class GLMQuantizationPipeline:
                 weights=layer_weights
             )
             
-            # FIX: Ensure calibration_batch is properly formatted for each layer
-            # Make a fresh copy of the original calibration data for this layer
-            self.logger.debug(f"[TYPE_CHECK] Before copying - original_calibration_batch type: {type(original_calibration_batch)}")
+            # FIX: Ensure calibration_batch is properly formatted for each layer - SAFE COPYING
+            # Make a fresh, independent copy of the original calibration data for this layer
+            self.logger.debug(f"[TYPE_CHECK] Before copying for {layer_name} - original type: {type(original_calibration_batch)}")
+            
+            # Create layer-specific calibration batch
+            calibration_batch = None
             
             if isinstance(original_calibration_batch, dict):
-                calibration_batch = {k: v.clone() if torch.is_tensor(v) else v 
-                                for k, v in original_calibration_batch.items()}
+                # Deep copy dictionary with validation
+                calibration_batch = {}
+                for k, v in original_calibration_batch.items():
+                    if isinstance(k, str):  # Ensure key is string, not something weird
+                        if torch.is_tensor(v):
+                            calibration_batch[k] = v.clone().detach()
+                            self.logger.debug(f"[TYPE_CHECK] Copied {k}: tensor shape={v.shape}, dtype={v.dtype}")
+                        elif v is None:
+                            calibration_batch[k] = None
+                        else:
+                            # Non-tensor, non-None value - be careful
+                            calibration_batch[k] = v
+                            self.logger.warning(f"[TYPE_CHECK] Non-tensor value for {k}: type={type(v)}")
+                    else:
+                        self.logger.error(f"[TYPE_CHECK] Non-string key in dict: {type(k)} = {k}")
+                        
                 self.logger.debug(f"[TYPE_CHECK] After dict copy - keys: {list(calibration_batch.keys())}")
+                
+                # Validate dict integrity
+                for k, v in calibration_batch.items():
+                    if isinstance(v, str) and v == k:
+                        self.logger.error(f"[TYPE_CHECK] CRITICAL BUG: Value is same as key: '{k}'")
+                        raise ValueError(f"Dictionary corruption detected: value=key for '{k}'")
+                        
             elif torch.is_tensor(original_calibration_batch):
-                calibration_batch = original_calibration_batch.clone()
+                calibration_batch = original_calibration_batch.clone().detach()
                 self.logger.debug(f"[TYPE_CHECK] After tensor clone - shape: {calibration_batch.shape}, dtype: {calibration_batch.dtype}")
-            else:
-                calibration_batch = original_calibration_batch
-                self.logger.warning(f"[TYPE_CHECK] Unknown type, no cloning: {type(calibration_batch)}")
-            
-            # Verify calibration_batch is not a string
-            if isinstance(calibration_batch, str):
-                self.logger.error(f"CRITICAL: calibration_batch became a string: '{calibration_batch}'")
-                # Recover by creating synthetic data
+                
+            elif original_calibration_batch is None:
+                self.logger.error(f"[TYPE_CHECK] original_calibration_batch is None!")
+                # Create synthetic fallback
                 if hasattr(layer_module, 'hidden_size'):
                     hidden_size = layer_module.hidden_size
                 else:
-                    hidden_size = 4096  # Default
-                calibration_batch = torch.randn(1, 128, hidden_size, device=device, dtype=torch.float16) * 0.02
+                    hidden_size = 4096
+                calibration_batch = torch.randn(1, 128, hidden_size, device='cpu', dtype=torch.float16) * 0.02
+                self.logger.warning(f"[TYPE_CHECK] Created synthetic calibration data")
+                
+            else:
+                # Unknown type - should not happen with proper initialization
+                self.logger.error(f"[TYPE_CHECK] Unknown type, cannot safely copy: {type(original_calibration_batch)}")
+                raise TypeError(f"Cannot handle calibration data type: {type(original_calibration_batch)}")
+            
+            # Verify calibration_batch is not a string
+            if isinstance(calibration_batch, str):
+                    self.logger.error(f"CRITICAL: calibration_batch became a string: '{calibration_batch}'")
+                    # Recover by creating synthetic data with correct dtype
+                    if hasattr(layer_module, 'hidden_size'):
+                        hidden_size = layer_module.hidden_size
+                    else:
+                        hidden_size = 4096  # Default
+                    
+                    # Get layer's expected dtype
+                    layer_dtype = next(layer_module.parameters()).dtype
+                    self.logger.info(f"Creating synthetic data with layer's dtype: {layer_dtype}")
+                    
+                    calibration_batch = torch.randn(1, 128, hidden_size, device=device, dtype=layer_dtype) * 0.02
+            
+            # Get layer's expected dtype for consistency - with better logging
+            layer_dtype = self.model_loader.get_layer_dtype(layer_name) if self.model_loader else next(layer_module.parameters()).dtype
+            self.logger.debug(f"Processing {layer_name} with expected dtype: {layer_dtype}")
+            
+            # Log dtype statistics periodically
+            if self.state.current_layer_idx % 10 == 0:
+                self.logger.info(f"Dtype check - Layer {layer_name}: {layer_dtype}, "
+                               f"Model default: {self.model_loader.model_dtype if self.model_loader else 'unknown'}")
+            
+            # Convert calibration batch dtype if needed (for float tensors)
+            if torch.is_tensor(calibration_batch):
+                if calibration_batch.dtype.is_floating_point and calibration_batch.dtype != layer_dtype:
+                    self.logger.info(f"Converting calibration batch from {calibration_batch.dtype} to {layer_dtype}")
+                    calibration_batch = calibration_batch.to(dtype=layer_dtype)
+            elif isinstance(calibration_batch, dict):
+                # Convert float tensors in dict to correct dtype
+                for key, value in calibration_batch.items():
+                    if torch.is_tensor(value) and value.dtype.is_floating_point and value.dtype != layer_dtype:
+                        self.logger.info(f"Converting {key} from {value.dtype} to {layer_dtype}")
+                        calibration_batch[key] = value.to(dtype=layer_dtype)
             
             # Adjust batch size if needed
             if allocation_strategy['batch_size'] < self.config.calibration_batch_size:
@@ -426,6 +520,20 @@ class GLMQuantizationPipeline:
                                 hidden_size = 4096
                             calibration_batch = torch.randn(1, 128, hidden_size, device=device, dtype=torch.float16) * 0.02
                         
+                        # Final type assertion before quantization
+                        assert calibration_batch is not None, f"calibration_batch is None for {layer_name}"
+                        assert not isinstance(calibration_batch, str), f"calibration_batch is string for {layer_name}: '{calibration_batch}'"
+                        
+                        if isinstance(calibration_batch, dict):
+                            # Ensure dict values are not strings
+                            for k, v in calibration_batch.items():
+                                if isinstance(v, str):
+                                    self.logger.error(f"[PIPELINE] Dict value for '{k}' is string: '{v}'")
+                                    raise ValueError(f"Calibration dict contains string value for key '{k}'")
+                        
+                        # Log final state before call
+                        self.logger.debug(f"[PIPELINE] Calling quantize_layer for {layer_name} with calibration type: {type(calibration_batch)}")
+                        
                         quantized_layer, result = self.layer_quantizer.quantize_layer(
                             layer=layer_module,
                             layer_name=layer_name,
@@ -442,25 +550,42 @@ class GLMQuantizationPipeline:
                             # Clear memory and retry with smaller batch
                             self.memory_manager.emergency_cleanup(required_memory_gb=estimated_size)
                             
-                            # Reduce batch size for next attempt
+                            # Reduce batch size for next attempt - PRESERVE STRUCTURE
                             if isinstance(calibration_batch, dict):
-                                # Handle dictionary format
+                                # Handle dictionary format - create new dict to avoid mutations
+                                new_batch = {}
+                                
                                 if 'input_ids' in calibration_batch:
-                                    batch_size = calibration_batch['input_ids'].shape[0]
-                                    if batch_size > 1:
-                                        calibration_batch = {
-                                            'input_ids': calibration_batch['input_ids'][:batch_size//2],
-                                            'attention_mask': calibration_batch.get('attention_mask', 
-                                                torch.ones_like(calibration_batch['input_ids']))[:batch_size//2]
-                                        }
-                                        self.logger.info(f"Reduced batch size to {batch_size//2}")
+                                    input_ids_tensor = calibration_batch['input_ids']
+                                    if torch.is_tensor(input_ids_tensor):
+                                        batch_size = input_ids_tensor.shape[0]
+                                        if batch_size > 1:
+                                            new_batch['input_ids'] = input_ids_tensor[:batch_size//2].clone()
+                                            
+                                            # Handle attention_mask if present
+                                            if 'attention_mask' in calibration_batch:
+                                                mask_tensor = calibration_batch['attention_mask']
+                                                if torch.is_tensor(mask_tensor):
+                                                    new_batch['attention_mask'] = mask_tensor[:batch_size//2].clone()
+                                            else:
+                                                # Create default mask
+                                                new_batch['attention_mask'] = torch.ones_like(new_batch['input_ids'])
+                                            
+                                            calibration_batch = new_batch
+                                            self.logger.info(f"Reduced batch size to {batch_size//2}")
+                                    else:
+                                        self.logger.error(f"input_ids is not a tensor: {type(input_ids_tensor)}")
+                                        
                                 elif 'hidden_states' in calibration_batch:
-                                    batch_size = calibration_batch['hidden_states'].shape[0]
-                                    if batch_size > 1:
-                                        calibration_batch = {
-                                            'hidden_states': calibration_batch['hidden_states'][:batch_size//2]
-                                        }
-                                        self.logger.info(f"Reduced batch size to {batch_size//2}")
+                                    hidden_states_tensor = calibration_batch['hidden_states']
+                                    if torch.is_tensor(hidden_states_tensor):
+                                        batch_size = hidden_states_tensor.shape[0]
+                                        if batch_size > 1:
+                                            new_batch['hidden_states'] = hidden_states_tensor[:batch_size//2].clone()
+                                            calibration_batch = new_batch
+                                            self.logger.info(f"Reduced batch size to {batch_size//2}")
+                                    else:
+                                        self.logger.error(f"hidden_states is not a tensor: {type(hidden_states_tensor)}")
                             elif torch.is_tensor(calibration_batch):
                                 batch_size = calibration_batch.shape[0]
                                 if batch_size > 1:
@@ -634,6 +759,100 @@ class GLMQuantizationPipeline:
         
         # Default to transformer
         return "transformer"
+    
+    def _ensure_dtype_consistency(self, data: Any, target_dtype: torch.dtype) -> Any:
+        """Ensure calibration data has consistent dtype with the model
+        
+        Args:
+            data: Calibration data (tensor, dict, or other)
+            target_dtype: Target dtype to match
+            
+        Returns:
+            Data with corrected dtype
+        """
+        if torch.is_tensor(data):
+            if data.dtype.is_floating_point and data.dtype != target_dtype:
+                self.logger.debug(f"Converting tensor from {data.dtype} to {target_dtype}")
+                return data.to(dtype=target_dtype)
+            return data
+            
+        elif isinstance(data, dict):
+            result = {}
+            for key, value in data.items():
+                if torch.is_tensor(value) and value.dtype.is_floating_point and value.dtype != target_dtype:
+                    self.logger.debug(f"Converting {key} from {value.dtype} to {target_dtype}")
+                    result[key] = value.to(dtype=target_dtype)
+                else:
+                    result[key] = value
+            return result
+            
+        elif hasattr(data, 'input_ids'):
+            # CalibrationSample - don't convert integer tensors
+            return data
+            
+        return data
+    
+    def _validate_calibration_data(self, data: Any, context: str = "") -> bool:
+        """Validate calibration data integrity
+        
+        Args:
+            data: Calibration data to validate
+            context: Context string for logging
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        prefix = f"[VALIDATION{' - ' + context if context else ''}]"
+        
+        if data is None:
+            self.logger.error(f"{prefix} Data is None")
+            return False
+            
+        if isinstance(data, str):
+            self.logger.error(f"{prefix} Data is string: '{data}'")
+            return False
+            
+        if isinstance(data, dict):
+            if not data:
+                self.logger.error(f"{prefix} Data is empty dict")
+                return False
+                
+            for k, v in data.items():
+                if not isinstance(k, str):
+                    self.logger.error(f"{prefix} Non-string key: {type(k)} = {k}")
+                    return False
+                    
+                if isinstance(v, str) and v == k:
+                    self.logger.error(f"{prefix} Value equals key: '{k}' = '{v}'")
+                    return False
+                    
+                if torch.is_tensor(v):
+                    if v.numel() == 0:
+                        self.logger.warning(f"{prefix} Empty tensor for key '{k}'")
+                    if torch.isnan(v).any() or torch.isinf(v).any():
+                        self.logger.error(f"{prefix} NaN/Inf in tensor for key '{k}'")
+                        return False
+                        
+            self.logger.debug(f"{prefix} Valid dict with keys: {list(data.keys())}")
+            return True
+            
+        if torch.is_tensor(data):
+            if data.numel() == 0:
+                self.logger.error(f"{prefix} Empty tensor")
+                return False
+            if torch.isnan(data).any() or torch.isinf(data).any():
+                self.logger.error(f"{prefix} NaN/Inf in tensor")
+                return False
+            self.logger.debug(f"{prefix} Valid tensor: shape={data.shape}, dtype={data.dtype}")
+            return True
+            
+        if hasattr(data, 'input_ids'):
+            # CalibrationSample object
+            self.logger.debug(f"{prefix} CalibrationSample object")
+            return True
+            
+        self.logger.warning(f"{prefix} Unknown data type: {type(data)}")
+        return True  # Allow unknown types to pass through
     
     def _reduce_batch_size(self, batch: Any, target_size: int) -> Any:
         """Reduce batch size for memory constraints

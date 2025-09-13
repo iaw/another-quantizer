@@ -266,16 +266,17 @@ class CalibrationDataHandler:
             return False
     
     def prepare_calibration_data(self, 
-                            batch_size: int = 2) -> DataLoader:
-        """Prepare calibration data loader - SIMPLIFIED"""
+                            batch_size: int = 2,
+                            dtype: torch.dtype = torch.float16) -> DataLoader:
+        """Prepare calibration data loader - SIMPLIFIED with dtype control"""
         if not self.raw_data:
             self.logger.warning("No raw data loaded, generating synthetic data")
             self._generate_synthetic_data()
         
         # Tokenize all samples
-        self.logger.info(f"Tokenizing {len(self.raw_data)} samples")
+        self.logger.info(f"Tokenizing {len(self.raw_data)} samples with dtype={dtype}")
         
-        # Simple tokenization
+        # Simple tokenization - no dtype conversion needed for input_ids (they're integers)
         self.processed_samples = []
         for text in self.raw_data[:self.num_samples]:
             tokens = self.tokenizer(
@@ -286,6 +287,8 @@ class CalibrationDataHandler:
                 return_tensors='pt'
             )
             
+            # Note: input_ids and attention_mask are integer tensors, not float
+            # They will be converted to embeddings by the model
             sample = CalibrationSample(
                 input_ids=tokens['input_ids'][0],
                 attention_mask=tokens['attention_mask'][0]
@@ -379,7 +382,8 @@ class CalibrationDataHandler:
                                hidden_size: int,
                                seq_length: int = None,
                                device: str = 'cpu',
-                               return_tokens: bool = False) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+                               return_tokens: bool = False,
+                               dtype: torch.dtype = torch.float16) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """Generate calibration inputs for layer processing
         
         Args:
@@ -387,12 +391,15 @@ class CalibrationDataHandler:
             seq_length: Sequence length (uses max_length if None)
             device: Device to place tensors on
             return_tokens: If True, return tokenized data instead of hidden states
+            dtype: Data type for generated tensors (default: float16)
             
         Returns:
             Tensor of shape [batch_size, seq_length, hidden_size] or dict with tokens
         """
         if seq_length is None:
             seq_length = self.max_length
+        
+        self.logger.debug(f"Generating calibration inputs with dtype={dtype}")
         
         if return_tokens and self.processed_samples:
             # Return actual tokenized data for proper forward pass
@@ -419,12 +426,12 @@ class CalibrationDataHandler:
             # Create more realistic hidden states based on token embeddings
             batch_size = min(len(self.processed_samples), self.num_samples)
             
-            # Initialize with small random values (like post-embedding)
+            # Initialize with small random values (like post-embedding) - with specified dtype
             inputs = torch.randn(
                 batch_size, 
                 seq_length, 
                 hidden_size,
-                dtype=torch.float16,
+                dtype=dtype,  # Use specified dtype
                 device=device
             ) * 0.02
             

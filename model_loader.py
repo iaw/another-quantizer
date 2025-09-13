@@ -41,11 +41,14 @@ class SequentialModelLoader:
         self.current_loaded_files = {}  # Track currently loaded files
         self.logger = logging.getLogger(__name__)
         self.dtype = torch.float16  # Default dtype
+        self.model_dtype = None  # Will be detected from weights
+        self.dtype_per_layer = {}  # Track dtype for each layer if mixed precision
         
         # Initialize by loading model configuration
         self.load_model_config()
         self.map_model_weights()
         self.build_layer_info()
+        self._detect_model_dtype()  # New method to detect actual dtype
         
     def load_model_config(self) -> Dict[str, Any]:
         """Load only the model configuration"""
@@ -69,20 +72,99 @@ class SequentialModelLoader:
         self.num_shared_experts = self.config.get('num_shared_experts', None)
         self.top_k_experts = self.config.get('num_experts_per_tok', 8)  # GLM4.5 uses top-8
         
-        # Set dtype based on config
+        # Set dtype based on config (will be verified against actual weights)
         torch_dtype = self.config.get('torch_dtype', 'float16')
-        if torch_dtype == 'float16':
+        if torch_dtype == 'float16' or torch_dtype == 'torch.float16':
             self.dtype = torch.float16
-        elif torch_dtype == 'bfloat16':
+        elif torch_dtype == 'bfloat16' or torch_dtype == 'torch.bfloat16':
             self.dtype = torch.bfloat16
-        else:
+        elif torch_dtype == 'float32' or torch_dtype == 'torch.float32':
             self.dtype = torch.float32
+        else:
+            self.logger.warning(f"Unknown torch_dtype in config: {torch_dtype}, defaulting to float16")
+            self.dtype = torch.float16
         
         self.logger.info(f"Loaded model config: {self.num_layers} layers, "
                         f"hidden_size={self.hidden_size}, "
                         f"num_experts={self.num_experts}")
         
         return self.config
+    
+    def _detect_model_dtype(self) -> None:
+        """Detect actual dtype from model weights
+        
+        This is more reliable than config as it checks actual weight files
+        """
+        self.logger.info("Detecting model dtype from weights...")
+        
+        # Sample a few weight files to detect dtype
+        sample_size = min(3, len(self.weight_files))
+        if sample_size == 0:
+            self.logger.warning("No weight files to detect dtype from")
+            self.model_dtype = self.dtype
+            return
+        
+        dtype_counts = {}
+        
+        for weight_file in self.weight_files[:sample_size]:
+            file_path = self.model_path / weight_file
+            
+            try:
+                if self.use_safetensors:
+                    # Check dtype from safetensors metadata
+                    with safetensors.safe_open(str(file_path), framework="pt") as f:
+                        # Sample a few tensors
+                        tensor_names = list(f.keys())[:5]
+                        for name in tensor_names:
+                            tensor = f.get_tensor(name)
+                            dtype = tensor.dtype
+                            dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+                            
+                            # Track per-layer dtype if needed
+                            layer_name = self._extract_layer_name(name)
+                            if layer_name not in self.dtype_per_layer:
+                                self.dtype_per_layer[layer_name] = dtype
+                else:
+                    # Load a small part of PyTorch file
+                    state_dict = torch.load(file_path, map_location='cpu', map_only=True)
+                    for name in list(state_dict.keys())[:5]:
+                        # We can't easily get dtype without loading in map_only mode
+                        # So we'll trust the config for PyTorch files
+                        break
+                        
+            except Exception as e:
+                self.logger.warning(f"Could not detect dtype from {weight_file}: {e}")
+        
+        # Determine most common dtype
+        if dtype_counts:
+            self.model_dtype = max(dtype_counts, key=dtype_counts.get)
+            self.logger.info(f"Detected model dtype: {self.model_dtype}")
+            
+            # Warn if different from config
+            if self.model_dtype != self.dtype:
+                self.logger.warning(f"Detected dtype {self.model_dtype} differs from config dtype {self.dtype}")
+                # Use detected dtype as it's more reliable
+                self.dtype = self.model_dtype
+        else:
+            # Fallback to config dtype
+            self.model_dtype = self.dtype
+            self.logger.info(f"Using config dtype: {self.model_dtype}")
+    
+    def get_layer_dtype(self, layer_name: str) -> torch.dtype:
+        """Get the expected dtype for a specific layer
+        
+        Args:
+            layer_name: Name of the layer
+            
+        Returns:
+            Expected dtype for the layer
+        """
+        # Check if we have layer-specific dtype
+        if layer_name in self.dtype_per_layer:
+            return self.dtype_per_layer[layer_name]
+        
+        # Otherwise use model-wide dtype
+        return self.model_dtype if self.model_dtype is not None else self.dtype
     
     def map_model_weights(self) -> Dict[str, str]:
         """Create mapping of layer names to weight files"""

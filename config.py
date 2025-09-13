@@ -25,6 +25,11 @@ class QuantizationConfig:
     group_size: int = 128  # AWQ recommended default
     symmetric: bool = False
     
+    # Dtype settings
+    compute_dtype: Optional[str] = None  # 'float16', 'bfloat16', 'float32', or None for auto-detect
+    force_dtype_conversion: bool = False  # Force all computations to use compute_dtype
+    mixed_precision: bool = True  # Allow different dtypes for different layers
+    
     # Memory settings
     max_gpu_memory: int = 20  # GB
     max_cpu_memory: int = 200  # GB
@@ -97,6 +102,12 @@ class QuantizationConfig:
         """Validate configuration settings"""
         errors = []
         warnings = []
+        
+        # Validate dtype settings
+        if self.compute_dtype is not None:
+            valid_dtypes = ['float16', 'bfloat16', 'float32', 'auto']
+            if self.compute_dtype not in valid_dtypes:
+                errors.append(f"Invalid compute_dtype: {self.compute_dtype}. Must be one of {valid_dtypes}")
         
         # Check if model_path exists
         if not self.model_path.exists():
