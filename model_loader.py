@@ -432,6 +432,11 @@ class SequentialModelLoader:
                     'down_proj': nn.Linear(self.intermediate_size, self.hidden_size, bias=False),
                 })
             
+            @property
+            def device(self):
+                """Get device of the layer"""
+                return next(self.parameters()).device
+            
             def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
                 """Forward pass with GQA attention"""
                 batch_size, seq_len, _ = hidden_states.shape
@@ -598,6 +603,10 @@ class SequentialModelLoader:
                             'down_proj': nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False),
                         })
                         self.shared_experts.append(expert)
+            @property
+            def device(self):
+                """Get device of the layer"""
+                return next(self.parameters()).device
             
             def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
                 """Forward pass for MoE layer with proper routing

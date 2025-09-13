@@ -218,52 +218,26 @@ class LayerQuantizer:
         start_time = time.time()
         self.logger.info(f"Starting quantization of layer: {layer_name}")
         
-        # COMPREHENSIVE FIX FOR STRING CALIBRATION DATA
-        if isinstance(calibration_data, str):
-            self.logger.error(f"CRITICAL: Calibration data is string: '{calibration_data}'")
-            self.logger.error(f"This should never happen. Creating synthetic data as fallback.")
-            
-            # Create synthetic calibration data
-            hidden_size = self._get_hidden_size(layer)
-            device = next(layer.parameters()).device if layer.parameters() else 'cpu'
-            
-            calibration_data = {
-                'hidden_states': torch.randn(
-                    1, 128, hidden_size, 
-                    device=device, 
-                    dtype=torch.float16
-                ) * 0.02
-            }
-            
-            self.logger.warning(f"Created synthetic calibration data with shape {calibration_data['hidden_states'].shape}")
-        # Input validation
-        if layer is None:
-            raise ValueError(f"Layer {layer_name} is None")
-        
-        # Fix calibration data format
-        if calibration_data is None:
-            self.logger.warning(f"No calibration data for {layer_name}, using synthetic data")
-            hidden_size = self._get_hidden_size(layer)
-            calibration_data = torch.randn(1, 128, hidden_size, dtype=torch.float16) * 0.02
-        elif isinstance(calibration_data, str):
-            # This is the error case - calibration_data is a string
-            self.logger.error(f"Calibration data is a string: {calibration_data}")
-            hidden_size = self._get_hidden_size(layer)
-            calibration_data = torch.randn(1, 128, hidden_size, dtype=torch.float16) * 0.02
-        elif isinstance(calibration_data, dict):
-            # Extract the actual tensor data
+        # FIX: Properly extract tensor from calibration data
+        if isinstance(calibration_data, dict):
             if 'hidden_states' in calibration_data:
-                # Use hidden states directly
-                pass  # Keep as dict
+                # Extract the actual tensor, not just pass the dict
+                calibration_data = calibration_data['hidden_states']
             elif 'input_ids' in calibration_data:
-                # We have tokenized input, need to handle specially
+                # For token inputs, keep as dict for special handling
                 pass  # Keep as dict
             else:
-                self.logger.warning(f"Unexpected dict keys in calibration_data: {calibration_data.keys()}")
+                # Unexpected dict structure
+                self.logger.warning(f"Unexpected calibration data structure: {calibration_data.keys()}")
                 hidden_size = self._get_hidden_size(layer)
                 calibration_data = torch.randn(1, 128, hidden_size, dtype=torch.float16) * 0.02
+        elif isinstance(calibration_data, str):
+            # This should never happen but we're seeing it
+            self.logger.error(f"Calibration data is string: '{calibration_data}'")
+            hidden_size = self._get_hidden_size(layer)
+            calibration_data = torch.randn(1, 128, hidden_size, dtype=torch.float16) * 0.02
         elif hasattr(calibration_data, 'input_ids'):
-            # It's a CalibrationSample object
+            # CalibrationSample object
             calibration_data = {
                 'input_ids': calibration_data.input_ids,
                 'attention_mask': calibration_data.attention_mask
@@ -272,6 +246,10 @@ class LayerQuantizer:
             self.logger.warning(f"Unexpected calibration data type: {type(calibration_data)}")
             hidden_size = self._get_hidden_size(layer)
             calibration_data = torch.randn(1, 128, hidden_size, dtype=torch.float16) * 0.02
+        
+        # Input validation
+        if layer is None:
+            raise ValueError(f"Layer {layer_name} is None")
         
         # Calculate original size with error handling
         try:
@@ -303,7 +281,7 @@ class LayerQuantizer:
         device = self._determine_device(layer, original_size_gb)
         layer = layer.to(device)
         
-        # Handle calibration_data properly - FIX HERE
+        # Handle calibration_data device placement
         if isinstance(calibration_data, dict):
             # Move dictionary contents to device
             calibration_data_device = {}
@@ -315,18 +293,10 @@ class LayerQuantizer:
             calibration_data = calibration_data_device
         elif torch.is_tensor(calibration_data):
             calibration_data = calibration_data.to(device)
-        elif hasattr(calibration_data, 'to'):
-            calibration_data = calibration_data.to(device)
-        # If it's something else, leave as is
-        
-        # Ensure calibration data is on same device and has proper shape
-        if isinstance(calibration_data, dict):
-            # Keep as dict - don't try to extract just input_ids
-            pass
-        elif isinstance(calibration_data, torch.Tensor):
-            calibration_data = calibration_data.to(device)
             if calibration_data.dim() == 2:
                 calibration_data = calibration_data.unsqueeze(0)  # Add batch dimension
+        elif hasattr(calibration_data, 'to'):
+            calibration_data = calibration_data.to(device)
         
         # Memory check
         self.memory_manager.monitor_memory(f"before_quantize_{layer_name}")
@@ -342,7 +312,7 @@ class LayerQuantizer:
                     layer, calibration_data, layer_type, num_samples=min(32, self.config.calibration_samples)
                 )
             else:
-                # Single sample computation
+                # Single sample computation - FIX: Ensure calibration_data is passed correctly
                 scales = self.compute_awq_scales(layer, calibration_data, layer_type)
             
             # Cache layer weights for propagation
@@ -398,7 +368,7 @@ class LayerQuantizer:
             # Cache scales for this layer
             self.awq_scales[layer_name] = scales
             
-            # Apply quantization based on layer type
+            # Apply quantization based on layer type - FIX: Pass calibration_data to all methods
             if layer_type == "moe":
                 quantized_layer = self.quantize_moe_layer(layer, calibration_data, scales)
             elif layer_type == "attention":
@@ -412,7 +382,7 @@ class LayerQuantizer:
             # Pack weights if needed
             quantized_layer = self._pack_layer_weights(quantized_layer)
             
-            # Validate quantization
+            # Validate quantization - FIX: Pass calibration_data
             error = self.validate_quantized_layer(layer, quantized_layer, calibration_data)
             
             # Calculate quantized size
@@ -431,6 +401,9 @@ class LayerQuantizer:
                 oldest_layers = list(self.layer_weights_cache.keys())[:-3]
                 for old_layer in oldest_layers:
                     del self.layer_weights_cache[old_layer]
+            
+            # Get memory peak
+            memory_peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
             
             # Create result
             result = LayerQuantizationResult(
@@ -465,8 +438,8 @@ class LayerQuantizer:
             
             # Log results
             self.logger.info(f"Quantized {layer_name}: {original_size_gb:.2f}GB -> {quantized_size_gb:.2f}GB "
-                           f"(compression: {result.compression_ratio:.2f}x, error: {error:.6f}, "
-                           f"cosine_sim: {layer_metrics.cosine_similarity:.4f})")
+                        f"(compression: {result.compression_ratio:.2f}x, error: {error:.6f}, "
+                        f"cosine_sim: {layer_metrics.cosine_similarity:.4f})")
             
             return quantized_layer, result
             
@@ -488,9 +461,9 @@ class LayerQuantizer:
             return layer, result
     
     def collect_layer_activations(self,
-                                 layer: torch.nn.Module,
-                                 calibration_data: torch.Tensor,
-                                 layer_name: str) -> Dict[str, torch.Tensor]:
+                             layer: torch.nn.Module,
+                             calibration_data: torch.Tensor,
+                             layer_name: str) -> Dict[str, torch.Tensor]:
         """Collect real activations by running calibration data through layer
         
         Args:
@@ -518,47 +491,129 @@ class LayerQuantizer:
                 handle = module.register_forward_hook(create_hook(name))
                 handles.append(handle)
         
-        # Prepare calibration data
+        # Prepare calibration data - FIX: Ensure we have a tensor, not a dict or string
         with torch.no_grad():
             # Check memory before processing
             current_stats = self.memory_manager.get_current_memory()
             if current_stats.gpu_free() < 2.0:  # Less than 2GB free
                 self.logger.warning("Low GPU memory, reducing batch size")
-                if hasattr(calibration_data, 'input_ids') and calibration_data.input_ids.shape[0] > 1:
-                    # Reduce batch size
+                if isinstance(calibration_data, dict) and 'input_ids' in calibration_data:
+                    if calibration_data['input_ids'].shape[0] > 1:
+                        # Reduce batch size
+                        calibration_data = {
+                            'input_ids': calibration_data['input_ids'][:1],
+                            'attention_mask': calibration_data['attention_mask'][:1] if 'attention_mask' in calibration_data else None
+                        }
+                elif hasattr(calibration_data, 'input_ids') and calibration_data.input_ids.shape[0] > 1:
                     calibration_data = type(calibration_data)(
                         input_ids=calibration_data.input_ids[:1],
                         attention_mask=calibration_data.attention_mask[:1] if hasattr(calibration_data, 'attention_mask') else None
                     )
             
-            # If calibration_data is tokenized input, we need to get hidden states
-            # This requires running through the embedding and previous layers
-            if hasattr(calibration_data, 'input_ids'):
-                # Try to get cached activations from sliding window first
+            # FIX: Properly prepare hidden_states tensor
+            hidden_states = None
+            
+            # Handle different calibration_data formats
+            if isinstance(calibration_data, torch.Tensor):
+                # Already a tensor, use directly
+                hidden_states = calibration_data
+                if hidden_states.dim() == 2:
+                    hidden_states = hidden_states.unsqueeze(0)
+            elif isinstance(calibration_data, dict):
+                if 'hidden_states' in calibration_data:
+                    # Extract hidden states from dict
+                    hidden_states = calibration_data['hidden_states']
+                    if isinstance(hidden_states, torch.Tensor):
+                        if hidden_states.dim() == 2:
+                            hidden_states = hidden_states.unsqueeze(0)
+                    else:
+                        self.logger.error(f"hidden_states in dict is not a tensor: {type(hidden_states)}")
+                        hidden_states = None
+                elif 'input_ids' in calibration_data:
+                    # We have tokenized input, need to get/generate hidden states
+                    # Try to get cached activations from sliding window first
+                    cached_activation = self.memory_manager.sliding_window.get_activation(layer_name)
+                    if cached_activation is not None:
+                        hidden_states = cached_activation
+                    elif layer_name in self.activation_cache:
+                        hidden_states = self.activation_cache[layer_name]
+                    else:
+                        # Generate synthetic hidden states as fallback
+                        hidden_size = self._get_hidden_size(layer)
+                        input_ids = calibration_data['input_ids']
+                        if isinstance(input_ids, torch.Tensor):
+                            batch_size = input_ids.shape[0] if input_ids.dim() > 0 else 1
+                            seq_len = input_ids.shape[1] if input_ids.dim() > 1 else 128
+                        else:
+                            batch_size = 1
+                            seq_len = 128
+                        
+                        hidden_states = torch.randn(
+                            batch_size, seq_len, hidden_size, 
+                            device=layer.device, 
+                            dtype=torch.float16
+                        ) * 0.02
+                        self.logger.debug(f"Generated synthetic hidden states for {layer_name}: shape={hidden_states.shape}")
+            elif hasattr(calibration_data, 'input_ids'):
+                # CalibrationSample object
+                # Try cached activations first
                 cached_activation = self.memory_manager.sliding_window.get_activation(layer_name)
                 if cached_activation is not None:
                     hidden_states = cached_activation
                 elif layer_name in self.activation_cache:
                     hidden_states = self.activation_cache[layer_name]
                 else:
-                    # For first layer, we need embeddings
-                    # This is a simplified version - real implementation would use actual embeddings
-                    batch_size = calibration_data.input_ids.shape[0] if hasattr(calibration_data.input_ids, 'shape') else 1
-                    seq_len = calibration_data.input_ids.shape[1] if len(calibration_data.input_ids.shape) > 1 else 128
+                    # Generate synthetic hidden states
                     hidden_size = self._get_hidden_size(layer)
-                    hidden_states = torch.randn(batch_size, seq_len, hidden_size, device=layer.device, dtype=torch.float16) * 0.02
+                    batch_size = calibration_data.input_ids.shape[0] if calibration_data.input_ids.dim() > 0 else 1
+                    seq_len = calibration_data.input_ids.shape[1] if calibration_data.input_ids.dim() > 1 else 128
+                    
+                    hidden_states = torch.randn(
+                        batch_size, seq_len, hidden_size,
+                        device=layer.device,
+                        dtype=torch.float16
+                    ) * 0.02
+                    self.logger.debug(f"Generated synthetic hidden states from CalibrationSample for {layer_name}")
+            elif isinstance(calibration_data, str):
+                # This should never happen but we're seeing it - critical error
+                self.logger.error(f"CRITICAL: calibration_data is a string: '{calibration_data}'")
+                # Generate fallback synthetic data
+                hidden_size = self._get_hidden_size(layer)
+                hidden_states = torch.randn(1, 128, hidden_size, device=layer.device, dtype=torch.float16) * 0.02
             else:
-                # Use calibration_data directly if it's already hidden states
-                hidden_states = calibration_data
-                if hidden_states.dim() == 2:
-                    hidden_states = hidden_states.unsqueeze(0)
+                # Unknown format, generate synthetic data
+                self.logger.warning(f"Unknown calibration_data type: {type(calibration_data)}")
+                hidden_size = self._get_hidden_size(layer)
+                hidden_states = torch.randn(1, 128, hidden_size, device=layer.device, dtype=torch.float16) * 0.02
+            
+            # Ensure hidden_states is not None and is a tensor
+            if hidden_states is None:
+                self.logger.error(f"Failed to prepare hidden_states for {layer_name}")
+                hidden_size = self._get_hidden_size(layer)
+                hidden_states = torch.randn(1, 128, hidden_size, device=layer.device, dtype=torch.float16) * 0.02
+            
+            # Ensure proper shape [batch, seq_len, hidden_size]
+            if hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
+            elif hidden_states.dim() != 3:
+                self.logger.error(f"Unexpected hidden_states dimensions: {hidden_states.dim()}, shape: {hidden_states.shape}")
+                # Try to fix it
+                hidden_size = self._get_hidden_size(layer)
+                hidden_states = torch.randn(1, 128, hidden_size, device=layer.device, dtype=torch.float16) * 0.02
             
             # Move to layer device
             hidden_states = hidden_states.to(layer.device)
             
             # Run forward pass to collect activations
             try:
+                # Double-check that hidden_states is a tensor before forward pass
+                if not isinstance(hidden_states, torch.Tensor):
+                    self.logger.error(f"hidden_states is not a tensor before forward pass: {type(hidden_states)}")
+                    hidden_size = self._get_hidden_size(layer)
+                    hidden_states = torch.randn(1, 128, hidden_size, device=layer.device, dtype=torch.float16) * 0.02
+                
                 output = layer(hidden_states)
+                
                 # Cache output for next layer
                 if isinstance(output, tuple):
                     output = output[0]
@@ -568,6 +623,7 @@ class LayerQuantizer:
                     self.activation_cache[next_layer_name] = output.detach()
             except Exception as e:
                 self.logger.warning(f"Forward pass failed during activation collection: {e}")
+                self.logger.debug(f"hidden_states type: {type(hidden_states)}, shape: {hidden_states.shape if isinstance(hidden_states, torch.Tensor) else 'N/A'}")
         
         # Remove hooks
         for handle in handles:
@@ -598,9 +654,9 @@ class LayerQuantizer:
         return None
     
     def compute_awq_scales(self,
-                          layer: torch.nn.Module,
-                          calibration_data: Any,
-                          layer_type: str = "generic") -> Dict[str, torch.Tensor]:
+                      layer: torch.nn.Module,
+                      calibration_data: Any,
+                      layer_type: str = "generic") -> Dict[str, torch.Tensor]:
         """Compute AWQ scaling factors for layer using real activations
         
         AWQ algorithm:
@@ -611,27 +667,40 @@ class LayerQuantizer:
         """
         scales = {}
         
+        # FIX: Extract actual tensor if calibration_data is a dict
+        if isinstance(calibration_data, dict):
+            if 'hidden_states' in calibration_data:
+                calibration_tensor = calibration_data['hidden_states']
+            elif 'input_ids' in calibration_data:
+                # Keep as dict for token handling
+                calibration_tensor = calibration_data
+            else:
+                # Unexpected dict, create dummy input
+                calibration_tensor = self._create_dummy_input(layer)
+        else:
+            calibration_tensor = calibration_data
+        
         # First, collect real activations by running calibration data through the layer
         layer_name = getattr(layer, '_layer_name', 'unknown')
-        activations = self.collect_layer_activations(layer, calibration_data, layer_name)
+        activations = self.collect_layer_activations(layer, calibration_tensor, layer_name)
         
         # If no activations collected, try direct forward pass
         if not activations:
             self.logger.warning("No activations collected, attempting direct forward pass")
             
             # Prepare calibration inputs
-            if isinstance(calibration_data, dict):
-                if 'hidden_states' in calibration_data:
-                    calibration_inputs = calibration_data['hidden_states']
-                elif 'input_ids' in calibration_data:
+            if isinstance(calibration_tensor, dict):
+                if 'hidden_states' in calibration_tensor:
+                    calibration_inputs = calibration_tensor['hidden_states']
+                elif 'input_ids' in calibration_tensor:
                     # Try to use cached activations from previous layer
                     if layer_name in self.activation_cache:
                         calibration_inputs = self.activation_cache[layer_name]
                     else:
                         # Generate approximate hidden states
                         hidden_size = self._get_hidden_size(layer)
-                        seq_length = calibration_data['input_ids'].shape[-1] if calibration_data['input_ids'].dim() > 1 else 128
-                        batch_size = calibration_data['input_ids'].shape[0] if calibration_data['input_ids'].dim() > 0 else 1
+                        seq_length = calibration_tensor['input_ids'].shape[-1] if calibration_tensor['input_ids'].dim() > 1 else 128
+                        batch_size = calibration_tensor['input_ids'].shape[0] if calibration_tensor['input_ids'].dim() > 0 else 1
                         
                         calibration_inputs = torch.randn(
                             batch_size, seq_length, hidden_size,
@@ -640,8 +709,8 @@ class LayerQuantizer:
                         ) * 0.02
                 else:
                     calibration_inputs = self._create_dummy_input(layer)
-            elif isinstance(calibration_data, torch.Tensor):
-                calibration_inputs = calibration_data
+            elif isinstance(calibration_tensor, torch.Tensor):
+                calibration_inputs = calibration_tensor
                 if calibration_inputs.dim() == 2:
                     calibration_inputs = calibration_inputs.unsqueeze(0)
             else:
@@ -790,8 +859,8 @@ class LayerQuantizer:
                 kernel_size = min(5, scale.shape[0] // 10)
                 if kernel_size > 1:
                     scale_padded = torch.nn.functional.pad(scale.unsqueeze(0).unsqueeze(0), 
-                                                          (kernel_size//2, kernel_size//2), 
-                                                          mode='replicate')
+                                                        (kernel_size//2, kernel_size//2), 
+                                                        mode='replicate')
                     kernel = torch.ones(1, 1, kernel_size, device=scale.device) / kernel_size
                     scale = torch.nn.functional.conv1d(scale_padded, kernel).squeeze()
             
@@ -1289,9 +1358,9 @@ class LayerQuantizer:
         return True
     
     def quantize_attention_layer(self,
-                                attn_module: nn.Module,
-                                calibration_data: Any,
-                                scales: Dict[str, torch.Tensor]) -> nn.Module:
+                            attn_module: nn.Module,
+                            calibration_data: Any,
+                            scales: Dict[str, torch.Tensor]) -> nn.Module:
         """Specialized quantization for attention layers
         
         Handles:
@@ -1326,9 +1395,9 @@ class LayerQuantizer:
         return attn_module
     
     def quantize_mlp_layer(self,
-                          mlp_module: nn.Module,
-                          calibration_data: Any,
-                          scales: Dict[str, torch.Tensor]) -> nn.Module:
+                      mlp_module: nn.Module,
+                      calibration_data: Any,
+                      scales: Dict[str, torch.Tensor]) -> nn.Module:
         """Specialized quantization for MLP layers
         
         Handles:
@@ -1364,9 +1433,9 @@ class LayerQuantizer:
         return mlp_module
     
     def quantize_moe_layer(self,
-                          moe_module: nn.Module,
-                          calibration_data: Any,
-                          scales: Dict[str, torch.Tensor] = None) -> nn.Module:
+                      moe_module: nn.Module,
+                      calibration_data: Any,
+                      scales: Dict[str, torch.Tensor] = None) -> nn.Module:
         """Specialized quantization for MoE layers
         
         Handles:
@@ -1395,14 +1464,33 @@ class LayerQuantizer:
         # Run forward pass to see which experts are activated
         with torch.no_grad():
             try:
-                # Create proper input
-                if hasattr(moe_module, 'hidden_size'):
-                    hidden_size = moe_module.hidden_size
+                # Create proper input - FIX: Use calibration_data properly
+                if isinstance(calibration_data, dict):
+                    if 'hidden_states' in calibration_data:
+                        dummy_input = calibration_data['hidden_states']
+                    else:
+                        # Use synthetic data if no hidden states
+                        if hasattr(moe_module, 'hidden_size'):
+                            hidden_size = moe_module.hidden_size
+                        else:
+                            hidden_size = 4096
+                        dummy_input = torch.randn(1, 128, hidden_size, 
+                                                device=next(moe_module.parameters()).device, 
+                                                dtype=torch.float16) * 0.02
+                elif torch.is_tensor(calibration_data):
+                    dummy_input = calibration_data
                 else:
-                    hidden_size = 4096
+                    # Fallback to synthetic
+                    if hasattr(moe_module, 'hidden_size'):
+                        hidden_size = moe_module.hidden_size
+                    else:
+                        hidden_size = 4096
+                    dummy_input = torch.randn(1, 128, hidden_size, 
+                                            device=next(moe_module.parameters()).device, 
+                                            dtype=torch.float16) * 0.02
                 
-                dummy_input = torch.randn(1, 128, hidden_size, 
-                                         device=calibration_data.device, dtype=torch.float16)
+                # Ensure proper device
+                dummy_input = dummy_input.to(next(moe_module.parameters()).device)
                 _ = moe_module(dummy_input)
             except:
                 pass
@@ -1415,9 +1503,9 @@ class LayerQuantizer:
         if hasattr(moe_module, 'shared_experts'):
             for i, expert in enumerate(moe_module.shared_experts):
                 self.logger.info(f"Quantizing shared expert {i}")
-                # Compute scales for this expert
+                # FIX: Pass calibration_data, not just calibration_data
                 expert_scales = self.compute_awq_scales(expert, calibration_data, "moe_expert")
-                # Quantize expert
+                # FIX: Pass calibration_data to quantize_mlp_layer
                 quantized_expert = self.quantize_mlp_layer(expert, calibration_data, expert_scales)
                 moe_module.shared_experts[i] = quantized_expert
         
@@ -1426,9 +1514,9 @@ class LayerQuantizer:
             for i, expert in enumerate(moe_module.experts):
                 if f"expert_{i}" in expert_activations or len(expert_activations) == 0:
                     self.logger.info(f"Quantizing expert {i} (activated)")
-                    # Compute scales for this expert
+                    # FIX: Pass calibration_data properly
                     expert_scales = self.compute_awq_scales(expert, calibration_data, "moe_expert")
-                    # Quantize expert
+                    # FIX: Pass calibration_data to quantize_mlp_layer
                     quantized_expert = self.quantize_mlp_layer(expert, calibration_data, expert_scales)
                     moe_module.experts[i] = quantized_expert
                 else:

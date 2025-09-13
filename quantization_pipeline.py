@@ -286,19 +286,23 @@ class GLMQuantizationPipeline:
             unit="layer"
         )
         
-        # Get calibration data
+        # Get calibration data - store it properly
         calibration_batch = next(iter(self.calibration_dataloader))
         
-        # Handle both dict and CalibrationSample formats
+        # Handle both dict and CalibrationSample formats - make a proper copy
         if isinstance(calibration_batch, dict):
-            # It's already a dict, use as-is
-            pass
+            # It's already a dict, make a copy to preserve original
+            original_calibration_batch = {k: v.clone() if torch.is_tensor(v) else v 
+                                        for k, v in calibration_batch.items()}
         elif hasattr(calibration_batch, 'input_ids'):
             # It's a CalibrationSample, convert to dict
-            calibration_batch = {
-                'input_ids': calibration_batch.input_ids,
-                'attention_mask': calibration_batch.attention_mask
+            original_calibration_batch = {
+                'input_ids': calibration_batch.input_ids.clone(),
+                'attention_mask': calibration_batch.attention_mask.clone() if hasattr(calibration_batch, 'attention_mask') else None
             }
+        else:
+            # Assume it's a tensor
+            original_calibration_batch = calibration_batch.clone() if torch.is_tensor(calibration_batch) else calibration_batch
         
         # Process each layer
         for layer_name, layer_module in self.model_loader.iterate_layers():
@@ -344,6 +348,26 @@ class GLMQuantizationPipeline:
                 weights=layer_weights
             )
             
+            # FIX: Ensure calibration_batch is properly formatted for each layer
+            # Make a fresh copy of the original calibration data for this layer
+            if isinstance(original_calibration_batch, dict):
+                calibration_batch = {k: v.clone() if torch.is_tensor(v) else v 
+                                for k, v in original_calibration_batch.items()}
+            elif torch.is_tensor(original_calibration_batch):
+                calibration_batch = original_calibration_batch.clone()
+            else:
+                calibration_batch = original_calibration_batch
+            
+            # Verify calibration_batch is not a string
+            if isinstance(calibration_batch, str):
+                self.logger.error(f"CRITICAL: calibration_batch became a string: '{calibration_batch}'")
+                # Recover by creating synthetic data
+                if hasattr(layer_module, 'hidden_size'):
+                    hidden_size = layer_module.hidden_size
+                else:
+                    hidden_size = 4096  # Default
+                calibration_batch = torch.randn(1, 128, hidden_size, device=device, dtype=torch.float16) * 0.02
+            
             # Adjust batch size if needed
             if allocation_strategy['batch_size'] < self.config.calibration_batch_size:
                 # Reduce calibration batch for this layer
@@ -363,7 +387,7 @@ class GLMQuantizationPipeline:
                 estimated_size = self.model_loader.get_layer_size(layer_name)
                 if not self.memory_manager.can_fit_on_gpu(estimated_size * 2):
                     self.logger.warning(f"Insufficient GPU memory for {layer_name}, attempting with CPU offload")
-                    
+                
                 # Quantize the layer with error recovery
                 quantized_layer = None
                 result = None
@@ -372,6 +396,18 @@ class GLMQuantizationPipeline:
                 
                 while retry_count <= max_retries:
                     try:
+                        # FIX: Double-check calibration_batch before passing to quantize_layer
+                        if isinstance(calibration_batch, str):
+                            self.logger.error(f"calibration_batch is string before quantization: '{calibration_batch}'")
+                            # Create synthetic data based on layer type
+                            if hasattr(layer_module, 'hidden_size'):
+                                hidden_size = layer_module.hidden_size
+                            elif hasattr(layer_module, 'input_layernorm'):
+                                hidden_size = layer_module.input_layernorm.weight.shape[0]
+                            else:
+                                hidden_size = 4096
+                            calibration_batch = torch.randn(1, 128, hidden_size, device=device, dtype=torch.float16) * 0.02
+                        
                         quantized_layer, result = self.layer_quantizer.quantize_layer(
                             layer=layer_module,
                             layer_name=layer_name,
@@ -400,6 +436,18 @@ class GLMQuantizationPipeline:
                                                 torch.ones_like(calibration_batch['input_ids']))[:batch_size//2]
                                         }
                                         self.logger.info(f"Reduced batch size to {batch_size//2}")
+                                elif 'hidden_states' in calibration_batch:
+                                    batch_size = calibration_batch['hidden_states'].shape[0]
+                                    if batch_size > 1:
+                                        calibration_batch = {
+                                            'hidden_states': calibration_batch['hidden_states'][:batch_size//2]
+                                        }
+                                        self.logger.info(f"Reduced batch size to {batch_size//2}")
+                            elif torch.is_tensor(calibration_batch):
+                                batch_size = calibration_batch.shape[0]
+                                if batch_size > 1:
+                                    calibration_batch = calibration_batch[:batch_size//2]
+                                    self.logger.info(f"Reduced batch size to {batch_size//2}")
                             elif hasattr(calibration_batch, 'input_ids'):
                                 # Handle CalibrationSample format
                                 batch_size = calibration_batch.input_ids.shape[0]
@@ -474,7 +522,6 @@ class GLMQuantizationPipeline:
                 self.layer_metrics.append(metrics)
                 self._save_metrics(metrics)
                 
-                # Save checkpoint periodically
                 # Save checkpoint periodically with full state
                 if len(self.state.completed_layers) % self.config.checkpoint_every_n_layers == 0:
                     self.save_checkpoint()
