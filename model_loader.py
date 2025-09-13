@@ -485,20 +485,21 @@ class SequentialModelLoader:
         class TransformerLayer(nn.Module):
             """GLM Transformer layer with GQA support"""
             
-            def __init__(self, config: Dict[str, Any]):
+            def __init__(self, config: Dict[str, Any], dtype: torch.dtype = torch.float16):
                 super().__init__()
                 self.hidden_size = config['hidden_size']
                 self.intermediate_size = config.get('intermediate_size', 10944)
                 self.num_heads = config['num_attention_heads']
                 self.num_kv_heads = config.get('num_key_value_heads', self.num_heads)
                 self.head_dim = config.get('head_dim', 128)  # Use explicit head_dim from config
+                self.dtype = dtype  # Store the expected dtype
                 
                 # For GLM-4, the attention projections have different sizes
                 self.q_size = self.num_heads * self.head_dim  # 96 * 128 = 12,288
                 self.kv_size = self.num_kv_heads * self.head_dim  # 8 * 128 = 1,024
                 
-                # Attention components
-                self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5)
+                # Attention components - ensure LayerNorm uses the correct dtype
+                self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5, dtype=dtype)
                 self.attention = nn.ModuleDict({
                     'q_proj': nn.Linear(self.hidden_size, self.q_size, bias=False),
                     'k_proj': nn.Linear(self.hidden_size, self.kv_size, bias=False),
@@ -506,8 +507,8 @@ class SequentialModelLoader:
                     'o_proj': nn.Linear(self.q_size, self.hidden_size, bias=False),
                 })
                 
-                # MLP components
-                self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5)
+                # MLP components - ensure LayerNorm uses the correct dtype
+                self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5, dtype=dtype)
                 self.mlp = nn.ModuleDict({
                     'gate_proj': nn.Linear(self.hidden_size, self.intermediate_size, bias=False),
                     'up_proj': nn.Linear(self.hidden_size, self.intermediate_size, bias=False),
@@ -521,11 +522,18 @@ class SequentialModelLoader:
             
             def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
                 """Forward pass with GQA attention"""
+                # Ensure input is in the correct dtype
+                if hasattr(self, 'dtype') and hidden_states.dtype != self.dtype:
+                    hidden_states = hidden_states.to(self.dtype)
+                
                 batch_size, seq_len, _ = hidden_states.shape
                 residual = hidden_states
                 
                 # Input layer norm
                 normed = self.input_layernorm(hidden_states)
+                # Ensure norm output maintains dtype
+                if normed.dtype != hidden_states.dtype:
+                    normed = normed.to(hidden_states.dtype)
                 
                 # Compute Q, K, V projections with different sizes
                 q = self.attention['q_proj'](normed)  # [batch, seq, 12288]
@@ -574,8 +582,10 @@ class SequentialModelLoader:
                 
                 return hidden_states
         
-        # Create layer module with actual config
-        layer = TransformerLayer(self.config)
+        # Create layer module with actual config and detected dtype
+        # Use the model's detected dtype for consistency
+        layer_dtype = self.model_dtype if self.model_dtype is not None else torch.float16
+        layer = TransformerLayer(self.config, dtype=layer_dtype)
         
         # Store layer name for reference
         layer._layer_name = f"transformer.layers.{layer_idx}"
@@ -595,11 +605,19 @@ class SequentialModelLoader:
             if f"layers.{layer_idx}." in weight_name:
                 component_name = weight_name.split(f"layers.{layer_idx}.")[-1]
                 
-                # Load attention weights
+                # Load attention weights - ensure consistent dtype
                 if 'input_layernorm' in component_name:
                     if 'weight' in component_name:
+                        # Convert to module's dtype if needed
+                        target_dtype = layer.input_layernorm.weight.dtype
+                        if weight_tensor.dtype != target_dtype:
+                            self.logger.debug(f"Converting {component_name} from {weight_tensor.dtype} to {target_dtype}")
+                            weight_tensor = weight_tensor.to(dtype=target_dtype)
                         layer.input_layernorm.weight.data = weight_tensor
                     elif 'bias' in component_name:
+                        target_dtype = layer.input_layernorm.bias.dtype if layer.input_layernorm.bias is not None else weight_tensor.dtype
+                        if weight_tensor.dtype != target_dtype:
+                            weight_tensor = weight_tensor.to(dtype=target_dtype)
                         layer.input_layernorm.bias.data = weight_tensor
                 
                 elif 'q_proj' in component_name and 'weight' in component_name:
@@ -636,8 +654,9 @@ class SequentialModelLoader:
         class MoELayer(nn.Module):
             """GLM MoE layer"""
             
-            def __init__(self, config: Dict[str, Any]):
+            def __init__(self, config: Dict[str, Any], dtype: torch.dtype = torch.float16):
                 super().__init__()
+                self.dtype = dtype  # Store expected dtype
                 self.hidden_size = config['hidden_size']
                 self.moe_intermediate_size = config.get('moe_intermediate_size', 1408)
                 self.num_experts = config.get('n_routed_experts', 128)
@@ -805,8 +824,9 @@ class SequentialModelLoader:
                 
                 return hidden_states
         
-        # Create MoE layer
-        layer = MoELayer(self.config) 
+        # Create MoE layer with detected dtype
+        layer_dtype = self.model_dtype if self.model_dtype is not None else torch.float16
+        layer = MoELayer(self.config, dtype=layer_dtype)
         
         # Load weights into the module
         for weight_name, weight_tensor in weights.items():

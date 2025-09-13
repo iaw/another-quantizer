@@ -380,13 +380,16 @@ class LayerQuantizer:
             layer_type = self._identify_layer_type(layer, layer_name)
             
             # Compute AWQ scales with multiple samples if available
-            if hasattr(calibration_data, '__iter__') and not isinstance(calibration_data, torch.Tensor):
-                # Use multi-sample computation for DataLoader
+            # FIX: Properly check for DataLoader, not just any iterable (dicts are iterable too!)
+            from torch.utils.data import DataLoader
+            if isinstance(calibration_data, DataLoader):
+                # Use multi-sample computation for actual DataLoader
                 scales = self.compute_awq_scales_multi_sample(
                     layer, calibration_data, layer_type, num_samples=min(32, self.config.calibration_samples)
                 )
             else:
-                # Single sample computation - FIX: Ensure calibration_data is passed correctly
+                # Single sample computation for dict, tensor, or CalibrationSample
+                # This is what we actually have - a single batch extracted from the DataLoader
                 scales = self.compute_awq_scales(layer, calibration_data, layer_type)
             
             # Cache layer weights for propagation
@@ -601,13 +604,31 @@ class LayerQuantizer:
             # FIX: Properly prepare hidden_states tensor - with careful extraction
             hidden_states = None
             
+            # Get the layer's expected dtype - check all parameters for consistency
+            layer_device = next(layer.parameters()).device
+            
+            # Check dtypes of all parameters to handle mixed precision
+            param_dtypes = set()
+            for param in layer.parameters():
+                param_dtypes.add(param.dtype)
+            
+            # If mixed dtypes, prefer bfloat16 > float16 > float32
+            if torch.bfloat16 in param_dtypes:
+                layer_dtype = torch.bfloat16
+            elif torch.float16 in param_dtypes:
+                layer_dtype = torch.float16
+            else:
+                layer_dtype = next(layer.parameters()).dtype
+            
+            self.logger.debug(f"Layer dtypes found: {param_dtypes}, using: {layer_dtype}, device={layer_device}")
+            
             # Handle different calibration_data formats
             if isinstance(calibration_data, torch.Tensor):
-                # Already a tensor, use directly (clone for safety)
-                hidden_states = calibration_data.clone()
+                # Already a tensor, use directly (clone for safety) and convert to layer's dtype
+                hidden_states = calibration_data.clone().to(device=layer_device, dtype=layer_dtype)
                 if hidden_states.dim() == 2:
                     hidden_states = hidden_states.unsqueeze(0)
-                self.logger.debug(f"Using tensor directly: shape={hidden_states.shape}")
+                self.logger.debug(f"Using tensor directly: shape={hidden_states.shape}, dtype={hidden_states.dtype}")
                 
             elif isinstance(calibration_data, dict):
                 self.logger.debug(f"Processing dict with keys: {list(calibration_data.keys())}")
@@ -634,8 +655,6 @@ class LayerQuantizer:
                     else:
                         # Generate synthetic hidden states as fallback - with correct dtype
                         hidden_size = self._get_hidden_size(layer)
-                        # Get layer's expected dtype
-                        layer_dtype = next(layer.parameters()).dtype
                         
                         input_ids = calibration_data['input_ids']
                         if isinstance(input_ids, torch.Tensor):
@@ -647,8 +666,8 @@ class LayerQuantizer:
                         
                         hidden_states = torch.randn(
                             batch_size, seq_len, hidden_size, 
-                            device=layer.device, 
-                            dtype=layer_dtype  # Use layer's dtype
+                            device=layer_device,  # Use already detected device
+                            dtype=layer_dtype  # Use already detected dtype
                         ) * 0.02
                         self.logger.debug(f"Generated synthetic hidden states for {layer_name}: shape={hidden_states.shape}")
             elif hasattr(calibration_data, 'input_ids'):
@@ -694,12 +713,12 @@ class LayerQuantizer:
                 hidden_states = hidden_states.unsqueeze(0)
             elif hidden_states.dim() != 3:
                 self.logger.error(f"Unexpected hidden_states dimensions: {hidden_states.dim()}, shape: {hidden_states.shape}")
-                # Try to fix it
+                # Try to fix it - use layer's dtype!
                 hidden_size = self._get_hidden_size(layer)
-                hidden_states = torch.randn(1, 128, hidden_size, device=layer.device, dtype=torch.float16) * 0.02
+                hidden_states = torch.randn(1, 128, hidden_size, device=layer_device, dtype=layer_dtype) * 0.02
             
-            # Move to layer device
-            hidden_states = hidden_states.to(layer.device)
+            # Move to layer device and ensure correct dtype
+            hidden_states = hidden_states.to(device=layer_device, dtype=layer_dtype)
             
             # Run forward pass to collect activations
             try:
@@ -769,11 +788,14 @@ class LayerQuantizer:
         if isinstance(calibration_data, str):
             self.logger.error(f"[TYPE_ERROR] calibration_data is string in compute_awq_scales: '{calibration_data}'")
             # Create emergency fallback data
+            # Create fallback with correct dtype
             hidden_size = self._get_hidden_size(layer)
-            calibration_data = torch.randn(1, 128, hidden_size, 
-                                          device=next(layer.parameters()).device, 
-                                          dtype=torch.float16) * 0.02
-            self.logger.warning(f"[TYPE_RECOVERY] Created synthetic calibration data with shape {calibration_data.shape}")
+            # Get the layer's expected dtype
+            layer_dtype = next(layer.parameters()).dtype
+            calibration_data = torch.randn(1, 128, hidden_size,
+                                        device=next(layer.parameters()).device,
+                                        dtype=layer_dtype) * 0.02  # Use layer's dtype, not hardcoded float16
+            self.logger.warning(f"[TYPE_RECOVERY] Using synthetic data shape {calibration_data.shape} with dtype {layer_dtype}")
         
         # FIX: Extract actual tensor if calibration_data is a dict - PROPERLY
         calibration_tensor = None
@@ -1004,10 +1026,10 @@ class LayerQuantizer:
         return scales
     
     def compute_awq_scales_multi_sample(self,
-                                       layer: torch.nn.Module,
-                                       calibration_dataloader: Any,
-                                       layer_type: str = "generic",
-                                       num_samples: int = 32) -> Dict[str, torch.Tensor]:
+                                   layer: torch.nn.Module,
+                                   calibration_dataloader: Any,
+                                   layer_type: str = "generic",
+                                   num_samples: int = 32) -> Dict[str, torch.Tensor]:
         """Compute AWQ scales using multiple calibration samples for better statistics
         
         Args:
@@ -1034,9 +1056,25 @@ class LayerQuantizer:
             if samples_processed >= num_samples:
                 break
             
-            # Get activations for this batch
+            # FIX: Properly handle the batch data structure
+            # The batch is a CalibrationSample object, not a raw tensor or dict
+            if hasattr(batch, 'input_ids'):
+                # It's a CalibrationSample - convert to dict format
+                batch_data = {
+                    'input_ids': batch.input_ids,
+                    'attention_mask': batch.attention_mask if hasattr(batch, 'attention_mask') else None
+                }
+            elif isinstance(batch, dict):
+                # It's already a dict
+                batch_data = batch
+            else:
+                # Unknown format - log and skip
+                self.logger.warning(f"Unknown batch format in multi-sample: {type(batch)}")
+                continue
+            
+            # Get activations for this batch - pass the proper data structure
             layer_name = getattr(layer, '_layer_name', f'layer_{batch_idx}')
-            batch_activations = self.collect_layer_activations(layer, batch, layer_name)
+            batch_activations = self.collect_layer_activations(layer, batch_data, layer_name)  # Pass batch_data, not batch
             
             # Accumulate activations
             for name, activation in batch_activations.items():
@@ -1044,8 +1082,15 @@ class LayerQuantizer:
                     accumulated_activations[name] = []
                 accumulated_activations[name].append(activation.cpu())
             
-            samples_processed += batch.input_ids.shape[0] if hasattr(batch, 'input_ids') else 1
+            # Update samples processed count
+            if hasattr(batch, 'input_ids'):
+                samples_processed += batch.input_ids.shape[0]
+            elif isinstance(batch_data, dict) and 'input_ids' in batch_data:
+                samples_processed += batch_data['input_ids'].shape[0]
+            else:
+                samples_processed += 1
         
+        # Rest of the method remains the same...
         # Concatenate all activations
         combined_activations = {}
         for name, activation_list in accumulated_activations.items():

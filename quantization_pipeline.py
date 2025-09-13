@@ -187,9 +187,13 @@ class GLMQuantizationPipeline:
             # Setup Calibration Data with model dtype
             self.logger.info("Preparing calibration data...")
             from calibration_data import CalibrationDataHandler
+            # Use a reasonable sequence length for calibration, not the maximum
+            # 2048 is sufficient for calibration and won't cause OOM
+            calibration_seq_length = min(2048, self.config.max_position_embeddings)
+            self.logger.info(f"Using calibration sequence length: {calibration_seq_length} (max: {self.config.max_position_embeddings})")
             self.calibration_handler = CalibrationDataHandler(
                 tokenizer=tokenizer,
-                max_length=self.config.max_position_embeddings,
+                max_length=calibration_seq_length,  # Use reasonable length for calibration
                 num_samples=self.config.calibration_samples,
                 hidden_size=hidden_size
             )
@@ -199,6 +203,10 @@ class GLMQuantizationPipeline:
             model_dtype = self.model_loader.model_dtype if self.model_loader.model_dtype else torch.float16
             self.logger.info(f"Preparing calibration data with model dtype: {model_dtype}")
             
+            # Ensure we use the correct dtype for calibration data
+            # BFloat16 models should use BFloat16 calibration data
+            if model_dtype == torch.bfloat16:
+                self.logger.info("Model uses BFloat16, preparing calibration data in BFloat16")
             self.calibration_dataloader = self.calibration_handler.prepare_calibration_data(
                 batch_size=self.config.calibration_batch_size,
                 dtype=model_dtype  # Pass model dtype
