@@ -350,13 +350,18 @@ class GLMQuantizationPipeline:
             
             # FIX: Ensure calibration_batch is properly formatted for each layer
             # Make a fresh copy of the original calibration data for this layer
+            self.logger.debug(f"[TYPE_CHECK] Before copying - original_calibration_batch type: {type(original_calibration_batch)}")
+            
             if isinstance(original_calibration_batch, dict):
                 calibration_batch = {k: v.clone() if torch.is_tensor(v) else v 
                                 for k, v in original_calibration_batch.items()}
+                self.logger.debug(f"[TYPE_CHECK] After dict copy - keys: {list(calibration_batch.keys())}")
             elif torch.is_tensor(original_calibration_batch):
                 calibration_batch = original_calibration_batch.clone()
+                self.logger.debug(f"[TYPE_CHECK] After tensor clone - shape: {calibration_batch.shape}, dtype: {calibration_batch.dtype}")
             else:
                 calibration_batch = original_calibration_batch
+                self.logger.warning(f"[TYPE_CHECK] Unknown type, no cloning: {type(calibration_batch)}")
             
             # Verify calibration_batch is not a string
             if isinstance(calibration_batch, str):
@@ -397,8 +402,21 @@ class GLMQuantizationPipeline:
                 while retry_count <= max_retries:
                     try:
                         # FIX: Double-check calibration_batch before passing to quantize_layer
+                        self.logger.debug(f"[TYPE_CHECK] Pre-quantize_layer call - type: {type(calibration_batch)}")
+                        if isinstance(calibration_batch, dict):
+                            self.logger.debug(f"[TYPE_CHECK] Dict keys: {list(calibration_batch.keys())}")
+                            # Log each value type
+                            for key, value in calibration_batch.items():
+                                if torch.is_tensor(value):
+                                    self.logger.debug(f"[TYPE_CHECK]   {key}: tensor shape={value.shape}, dtype={value.dtype}")
+                                else:
+                                    self.logger.debug(f"[TYPE_CHECK]   {key}: type={type(value)}")
+                        elif torch.is_tensor(calibration_batch):
+                            self.logger.debug(f"[TYPE_CHECK] Tensor shape={calibration_batch.shape}, dtype={calibration_batch.dtype}")
+                        
                         if isinstance(calibration_batch, str):
-                            self.logger.error(f"calibration_batch is string before quantization: '{calibration_batch}'")
+                            self.logger.error(f"[TYPE_ERROR] calibration_batch is string before quantization: '{calibration_batch}'")
+                            self.logger.error(f"[TYPE_ERROR] This should never happen - investigating corruption source")
                             # Create synthetic data based on layer type
                             if hasattr(layer_module, 'hidden_size'):
                                 hidden_size = layer_module.hidden_size

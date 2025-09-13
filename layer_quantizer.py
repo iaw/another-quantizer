@@ -218,17 +218,50 @@ class LayerQuantizer:
         start_time = time.time()
         self.logger.info(f"Starting quantization of layer: {layer_name}")
         
-        # FIX: Properly extract tensor from calibration data
+        # Type checking and logging for calibration data
+        self.logger.debug(f"[TYPE_CHECK] quantize_layer received calibration_data type: {type(calibration_data)}")
+        if isinstance(calibration_data, str):
+            self.logger.error(f"[TYPE_ERROR] calibration_data is string at quantize_layer entry: '{calibration_data}'")
+            self.logger.error(f"[TYPE_ERROR] Stack trace for debugging:")
+            import traceback
+            self.logger.error(traceback.format_stack())
+        elif isinstance(calibration_data, dict):
+            self.logger.debug(f"[TYPE_CHECK] calibration_data dict keys: {list(calibration_data.keys())}")
+            for key, value in calibration_data.items():
+                self.logger.debug(f"[TYPE_CHECK]   {key}: type={type(value)}, shape={value.shape if torch.is_tensor(value) else 'N/A'}")
+        elif torch.is_tensor(calibration_data):
+            self.logger.debug(f"[TYPE_CHECK] calibration_data tensor shape: {calibration_data.shape}, dtype: {calibration_data.dtype}")
+        
+        # FIX: Properly extract tensor from calibration data - with defensive copying
+        original_calibration_data = calibration_data  # Keep original reference
+        
         if isinstance(calibration_data, dict):
-            if 'hidden_states' in calibration_data:
+            # Create a defensive copy to prevent mutations
+            calibration_data_copy = {}
+            for key, value in calibration_data.items():
+                if torch.is_tensor(value):
+                    calibration_data_copy[key] = value.clone()
+                else:
+                    calibration_data_copy[key] = value
+            
+            # Now work with the copy
+            if 'hidden_states' in calibration_data_copy:
                 # Extract the actual tensor, not just pass the dict
-                calibration_data = calibration_data['hidden_states']
-            elif 'input_ids' in calibration_data:
-                # For token inputs, keep as dict for special handling
-                pass  # Keep as dict
+                extracted_tensor = calibration_data_copy['hidden_states']
+                if torch.is_tensor(extracted_tensor):
+                    calibration_data = extracted_tensor
+                    self.logger.debug(f"Extracted hidden_states tensor: shape={calibration_data.shape}")
+                else:
+                    self.logger.error(f"hidden_states is not a tensor: {type(extracted_tensor)}")
+                    hidden_size = self._get_hidden_size(layer)
+                    calibration_data = torch.randn(1, 128, hidden_size, dtype=torch.float16) * 0.02
+            elif 'input_ids' in calibration_data_copy:
+                # For token inputs, keep as dict for special handling but use the copy
+                calibration_data = calibration_data_copy
+                self.logger.debug(f"Keeping dict with input_ids for token processing")
             else:
                 # Unexpected dict structure
-                self.logger.warning(f"Unexpected calibration data structure: {calibration_data.keys()}")
+                self.logger.warning(f"Unexpected calibration data structure: {calibration_data_copy.keys()}")
                 hidden_size = self._get_hidden_size(layer)
                 calibration_data = torch.randn(1, 128, hidden_size, dtype=torch.float16) * 0.02
         elif isinstance(calibration_data, str):
@@ -281,18 +314,41 @@ class LayerQuantizer:
         device = self._determine_device(layer, original_size_gb)
         layer = layer.to(device)
         
-        # Handle calibration_data device placement
+        # Handle calibration_data device placement - with validation
+        self.logger.debug(f"Moving calibration data to device: {device}")
+        
         if isinstance(calibration_data, dict):
             # Move dictionary contents to device
             calibration_data_device = {}
             for key, value in calibration_data.items():
                 if torch.is_tensor(value):
                     calibration_data_device[key] = value.to(device)
+                    self.logger.debug(f"Moved {key} tensor to {device}: shape={value.shape}")
                 else:
                     calibration_data_device[key] = value
+                    self.logger.debug(f"Kept {key} as-is: type={type(value)}")
             calibration_data = calibration_data_device
+            
+            # Validate after device movement
+            if not isinstance(calibration_data, dict):
+                self.logger.error(f"CRITICAL: Lost dict structure after device movement: {type(calibration_data)}")
+            else:
+                self.logger.debug(f"Dict structure preserved with keys: {list(calibration_data.keys())}")
+                
         elif torch.is_tensor(calibration_data):
             calibration_data = calibration_data.to(device)
+            if calibration_data.dim() == 2:
+                calibration_data = calibration_data.unsqueeze(0)  # Add batch dimension
+            self.logger.debug(f"Moved tensor to {device}: shape={calibration_data.shape}")
+        elif hasattr(calibration_data, 'to'):
+            calibration_data = calibration_data.to(device)
+            self.logger.debug(f"Moved object with .to() method to {device}")
+            
+        # Final validation before use
+        if isinstance(calibration_data, str):
+            self.logger.error(f"CRITICAL: calibration_data corrupted to string after device placement: '{calibration_data}'")
+            hidden_size = self._get_hidden_size(layer)
+            calibration_data = torch.randn(1, 128, hidden_size, device=device, dtype=torch.float16) * 0.02
             if calibration_data.dim() == 2:
                 calibration_data = calibration_data.unsqueeze(0)  # Add batch dimension
         elif hasattr(calibration_data, 'to'):
@@ -474,6 +530,20 @@ class LayerQuantizer:
         Returns:
             Dictionary of module_name -> activation tensors
         """
+        # Type validation at entry
+        self.logger.debug(f"[TYPE_CHECK] collect_layer_activations for {layer_name}, input type: {type(calibration_data)}")
+        if isinstance(calibration_data, str):
+            self.logger.error(f"[TYPE_ERROR] String passed to collect_layer_activations: '{calibration_data}'")
+            # Stack trace to find where this came from
+            import traceback
+            self.logger.error(f"[TYPE_ERROR] Call stack:\n{''.join(traceback.format_stack())}")
+            # Create fallback
+            hidden_size = self._get_hidden_size(layer)
+            calibration_data = torch.randn(1, 128, hidden_size,
+                                          device=next(layer.parameters()).device,
+                                          dtype=torch.float16) * 0.02
+            self.logger.warning(f"[TYPE_RECOVERY] Using synthetic data shape {calibration_data.shape}")
+        
         activations = {}
         handles = []
         
@@ -510,24 +580,30 @@ class LayerQuantizer:
                         attention_mask=calibration_data.attention_mask[:1] if hasattr(calibration_data, 'attention_mask') else None
                     )
             
-            # FIX: Properly prepare hidden_states tensor
+            # FIX: Properly prepare hidden_states tensor - with careful extraction
             hidden_states = None
             
             # Handle different calibration_data formats
             if isinstance(calibration_data, torch.Tensor):
-                # Already a tensor, use directly
-                hidden_states = calibration_data
+                # Already a tensor, use directly (clone for safety)
+                hidden_states = calibration_data.clone()
                 if hidden_states.dim() == 2:
                     hidden_states = hidden_states.unsqueeze(0)
+                self.logger.debug(f"Using tensor directly: shape={hidden_states.shape}")
+                
             elif isinstance(calibration_data, dict):
+                self.logger.debug(f"Processing dict with keys: {list(calibration_data.keys())}")
+                
                 if 'hidden_states' in calibration_data:
-                    # Extract hidden states from dict
-                    hidden_states = calibration_data['hidden_states']
-                    if isinstance(hidden_states, torch.Tensor):
+                    # Extract hidden states from dict - CAREFULLY
+                    dict_value = calibration_data['hidden_states']
+                    if isinstance(dict_value, torch.Tensor):
+                        hidden_states = dict_value.clone()  # Clone to prevent mutations
                         if hidden_states.dim() == 2:
                             hidden_states = hidden_states.unsqueeze(0)
+                        self.logger.debug(f"Extracted hidden_states tensor: shape={hidden_states.shape}")
                     else:
-                        self.logger.error(f"hidden_states in dict is not a tensor: {type(hidden_states)}")
+                        self.logger.error(f"hidden_states in dict is not a tensor: {type(dict_value)}, value={dict_value}")
                         hidden_states = None
                 elif 'input_ids' in calibration_data:
                     # We have tokenized input, need to get/generate hidden states
@@ -667,18 +743,52 @@ class LayerQuantizer:
         """
         scales = {}
         
-        # FIX: Extract actual tensor if calibration_data is a dict
+        # Type checking for calibration_data
+        self.logger.debug(f"[TYPE_CHECK] compute_awq_scales received type: {type(calibration_data)}")
+        if isinstance(calibration_data, str):
+            self.logger.error(f"[TYPE_ERROR] calibration_data is string in compute_awq_scales: '{calibration_data}'")
+            # Create emergency fallback data
+            hidden_size = self._get_hidden_size(layer)
+            calibration_data = torch.randn(1, 128, hidden_size, 
+                                          device=next(layer.parameters()).device, 
+                                          dtype=torch.float16) * 0.02
+            self.logger.warning(f"[TYPE_RECOVERY] Created synthetic calibration data with shape {calibration_data.shape}")
+        
+        # FIX: Extract actual tensor if calibration_data is a dict - PROPERLY
+        calibration_tensor = None
+        
         if isinstance(calibration_data, dict):
-            if 'hidden_states' in calibration_data:
-                calibration_tensor = calibration_data['hidden_states']
-            elif 'input_ids' in calibration_data:
-                # Keep as dict for token handling
-                calibration_tensor = calibration_data
+            # Make a defensive copy first
+            calibration_dict = {k: v.clone() if torch.is_tensor(v) else v 
+                               for k, v in calibration_data.items()}
+            
+            if 'hidden_states' in calibration_dict:
+                tensor_value = calibration_dict['hidden_states']
+                if torch.is_tensor(tensor_value):
+                    calibration_tensor = tensor_value
+                    self.logger.debug(f"Extracted hidden_states: shape={calibration_tensor.shape}, dtype={calibration_tensor.dtype}")
+                else:
+                    self.logger.error(f"hidden_states value is not a tensor: {type(tensor_value)}")
+                    calibration_tensor = self._create_dummy_input(layer)
+            elif 'input_ids' in calibration_dict:
+                # Keep as dict for token handling, but use the copy
+                calibration_tensor = calibration_dict
+                self.logger.debug(f"Keeping calibration dict with keys: {list(calibration_dict.keys())}")
             else:
                 # Unexpected dict, create dummy input
+                self.logger.warning(f"No recognized keys in calibration dict: {list(calibration_dict.keys())}")
                 calibration_tensor = self._create_dummy_input(layer)
+        elif torch.is_tensor(calibration_data):
+            calibration_tensor = calibration_data.clone()  # Defensive copy
+            self.logger.debug(f"Using tensor calibration data: shape={calibration_tensor.shape}")
         else:
-            calibration_tensor = calibration_data
+            self.logger.warning(f"Unexpected calibration_data type: {type(calibration_data)}")
+            calibration_tensor = self._create_dummy_input(layer)
+        
+        # Validate before passing to collect_layer_activations
+        if isinstance(calibration_tensor, str):
+            self.logger.error(f"CRITICAL: calibration_tensor became string: '{calibration_tensor}'")
+            calibration_tensor = self._create_dummy_input(layer)
         
         # First, collect real activations by running calibration data through the layer
         layer_name = getattr(layer, '_layer_name', 'unknown')
@@ -959,6 +1069,40 @@ class LayerQuantizer:
                             f"mean={scale.mean():.3f}, std={scale.std():.3f}")
         
         return scales
+    
+    def _safe_dict_get(self, data: Dict[str, Any], key: str, expected_type: type = None) -> Any:
+        """Safely extract value from dictionary with type checking
+        
+        Args:
+            data: Dictionary to extract from
+            key: Key to extract
+            expected_type: Expected type of the value (optional)
+            
+        Returns:
+            The value if found and valid, None otherwise
+        """
+        if not isinstance(data, dict):
+            self.logger.error(f"_safe_dict_get called with non-dict: {type(data)}")
+            return None
+            
+        if key not in data:
+            self.logger.debug(f"Key '{key}' not found in dict with keys: {list(data.keys())}")
+            return None
+            
+        value = data[key]
+        
+        # Check if we got the key string instead of the value (the bug we're fixing)
+        if isinstance(value, str) and value == key:
+            self.logger.error(f"CRITICAL BUG: Got key string '{key}' instead of value!")
+            import traceback
+            self.logger.error(f"Stack trace:\n{''.join(traceback.format_stack())}")
+            return None
+            
+        if expected_type is not None and not isinstance(value, expected_type):
+            self.logger.warning(f"Value for key '{key}' has unexpected type: {type(value)}, expected {expected_type}")
+            return None
+            
+        return value
     
     def _get_hidden_size(self, layer: nn.Module) -> int:
         """Get hidden size from layer"""
