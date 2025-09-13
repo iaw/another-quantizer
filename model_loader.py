@@ -563,39 +563,39 @@ class SequentialModelLoader:
                 # Attention sizes
                 self.q_size = self.num_heads * self.head_dim
                 self.kv_size = self.num_kv_heads * self.head_dim
-                assert num_experts > 0, f"num_experts must be positive, got {num_experts}"
+                assert self.num_experts > 0, f"num_experts must be positive, got {self.num_experts}"
                 
                 # Attention components (same as transformer)
-                self.input_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+                self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5)
                 self.attention = nn.ModuleDict({
-                    'q_proj': nn.Linear(hidden_size, hidden_size, bias=False),
-                    'k_proj': nn.Linear(hidden_size, hidden_size, bias=False),
-                    'v_proj': nn.Linear(hidden_size, hidden_size, bias=False),
-                    'o_proj': nn.Linear(hidden_size, hidden_size, bias=False),
+                    'q_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+                    'k_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+                    'v_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+                    'o_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False),
                 })
                 
                 # MoE components
-                self.post_attention_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
-                self.router = nn.Linear(hidden_size, num_experts, bias=False)
+                self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5)
+                self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
                 
                 # Create experts
                 self.experts = nn.ModuleList()
-                for _ in range(num_experts):
+                for _ in range(self.num_experts):
                     expert = nn.ModuleDict({
-                        'gate_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
-                        'up_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
-                        'down_proj': nn.Linear(intermediate_size, hidden_size, bias=False),
+                        'gate_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
+                        'up_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
+                        'down_proj': nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False),
                     })
                     self.experts.append(expert)
                 
                 # Shared experts if applicable
-                if num_shared_experts > 0:
+                if self.num_shared_experts > 0:
                     self.shared_experts = nn.ModuleList()
-                    for _ in range(num_shared_experts):
+                    for _ in range(self.num_shared_experts):
                         expert = nn.ModuleDict({
-                            'gate_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
-                            'up_proj': nn.Linear(hidden_size, intermediate_size, bias=False),
-                            'down_proj': nn.Linear(intermediate_size, hidden_size, bias=False),
+                            'gate_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
+                            'up_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
+                            'down_proj': nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False),
                         })
                         self.shared_experts.append(expert)
             
@@ -715,13 +715,7 @@ class SequentialModelLoader:
                 return hidden_states
         
         # Create MoE layer
-        layer = MoELayer(
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            num_experts=self.num_experts or 8,
-            num_shared_experts=self.num_shared_experts or 0,
-            num_heads=self.num_attention_heads
-        )
+        layer = MoELayer(self.config) 
         
         # Load weights into the module
         for weight_name, weight_tensor in weights.items():
@@ -1065,7 +1059,10 @@ class SequentialModelLoader:
     
     def _determine_layer_type(self, layer_name: str) -> str:
         """Determine the type of layer"""
-        if 'embedding' in layer_name.lower():
+        layer_name_lower = layer_name.lower()
+        
+        # Check for embedding - need to handle 'embed_tokens' specifically
+        if 'embedding' in layer_name_lower or 'embed' in layer_name_lower:
             return 'embedding'
         elif 'lm_head' in layer_name.lower() or 'output' in layer_name.lower():
             return 'lm_head'

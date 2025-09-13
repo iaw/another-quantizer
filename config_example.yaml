@@ -2,9 +2,9 @@
 # Example configuration for GLM quantization
 
 # Required paths
-model_path: /models/glm-4-9b        # Path to original model
-output_path: /models/glm-4-9b-int4  # Where to save quantized model
-checkpoint_dir: /models/checkpoints # Checkpoint directory
+model_path: /home/username/ssd/GLM-Steam-106B-A12B-v1        # Path to original model
+output_path: /home/username/ssd/GLM-Steam-106B-A12B-v1-AWQ  # Where to save quantized model
+checkpoint_dir: /home/username/ssd/GLM-Steam-106B-A12B-v1-AWQ/checkpoints # Checkpoint directory
 
 # Quantization settings
 bits: 4                              # Quantization bits (3, 4, or 8)
@@ -30,8 +30,9 @@ awq_protection_factor: 1.5           # Protection for salient channels
 
 # Layers to skip (keep in original precision)
 skip_layers:
+  - "*embed*"
+  - "*embedding*"
   - "lm_head"
   - "*.layernorm"
   - "*.norm"
-  - "embedding*"
   - "*.router"

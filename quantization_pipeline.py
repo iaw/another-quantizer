@@ -593,9 +593,20 @@ class GLMQuantizationPipeline:
         
         return batch
     
-    def save_quantized_layer(self, layer_name: str, layer: nn.Module) -> None:
-        """Save quantized layer to disk"""
-        weights_dir = self.checkpoint_manager.checkpoint_dir / "quantized_weights"
+    def save_quantized_layer(self, layer_name: str, layer: nn.Module, result: Any = None, output_dir: Path = None) -> None:
+        """Save quantized layer to disk
+        
+        Args:
+            layer_name: Name of the layer
+            layer: Quantized layer module
+            result: Quantization result (optional, for metadata)
+            output_dir: Override output directory (optional)
+        """
+        if output_dir is None:
+            weights_dir = self.checkpoint_manager.checkpoint_dir / "quantized_weights"
+        else:
+            weights_dir = output_dir
+        
         weights_dir.mkdir(parents=True, exist_ok=True)
         
         # Extract state dict from layer
@@ -609,10 +620,21 @@ class GLMQuantizationPipeline:
             full_name = f"{layer_name}.{name}"
             state_dict[full_name] = buffer.cpu()
         
+        # Add metadata if result is provided
+        metadata = {}
+        if result is not None:
+            metadata = {
+                'layer_name': layer_name,
+                'compression_ratio': str(result.compression_ratio) if hasattr(result, 'compression_ratio') else '1.0',
+                'quantization_error': str(result.quantization_error) if hasattr(result, 'quantization_error') else '0.0',
+                'bits': str(self.config.bits),
+                'group_size': str(self.config.group_size),
+            }
+        
         # Save to safetensors
         import safetensors.torch
         output_file = weights_dir / f"{layer_name.replace('/', '_')}.safetensors"
-        safetensors.torch.save_file(state_dict, str(output_file))
+        safetensors.torch.save_file(state_dict, str(output_file), metadata=metadata)
         
         self.logger.debug(f"Saved quantized layer to {output_file}")
     
