@@ -218,20 +218,35 @@ class SequentialModelLoader:
                 raise
     
     def load_layer(self, layer_name: str) -> nn.Module:
-        """Load a single layer from disk
+        """Load a single layer from disk with validation
         
         Returns proper nn.Module constructed from weights
         """
         if layer_name not in self.layer_info:
             self.logger.error(f"Layer {layer_name} not found in layer_info")
-            raise KeyError(f"Layer {layer_name} not found")
+            # Try to find similar layer name
+            similar = [name for name in self.layer_info.keys() if layer_name in name or name in layer_name]
+            if similar:
+                self.logger.info(f"Similar layers found: {similar}")
+                if len(similar) == 1:
+                    layer_name = similar[0]
+                    self.logger.info(f"Using similar layer: {layer_name}")
+                else:
+                    raise KeyError(f"Layer {layer_name} not found. Similar: {similar}")
+            else:
+                raise KeyError(f"Layer {layer_name} not found")
         
         layer_info = self.layer_info[layer_name]
         self.logger.info(f"Loading layer: {layer_name} (type: {layer_info.layer_type}, "
                         f"size: {layer_info.estimated_size_gb:.2f}GB)")
         
-        # Load required weight files
+        # Validate layer info
+        if not layer_info.weight_files:
+            raise ValueError(f"No weight files specified for {layer_name}")
+        
+        # Load required weight files with validation
         weights = {}
+        missing_files = []
         for weight_file in layer_info.weight_files:
             file_path = self.model_path / weight_file
             
@@ -327,6 +342,51 @@ class SequentialModelLoader:
         
         return tensors
     
+    def _validate_and_reshape_input(self, hidden_states: torch.Tensor, hidden_size: int) -> torch.Tensor:
+        """Validate and reshape input tensor for layer processing
+        
+        Args:
+            hidden_states: Input tensor
+            hidden_size: Expected hidden dimension
+            
+        Returns:
+            Properly shaped tensor [batch, seq_len, hidden_size]
+        """
+        # Handle different input shapes
+        if hidden_states.dim() == 1:
+            # [hidden_size] -> [1, 1, hidden_size]
+            if hidden_states.shape[0] == hidden_size:
+                hidden_states = hidden_states.unsqueeze(0).unsqueeze(0)
+            else:
+                raise ValueError(f"1D input shape {hidden_states.shape} doesn't match hidden_size {hidden_size}")
+                
+        elif hidden_states.dim() == 2:
+            if hidden_states.shape[-1] == hidden_size:
+                # [seq_len, hidden_size] -> [1, seq_len, hidden_size]
+                hidden_states = hidden_states.unsqueeze(0)
+            elif hidden_states.shape[0] == hidden_size:
+                # [hidden_size, seq_len] -> [1, seq_len, hidden_size] (transpose)
+                hidden_states = hidden_states.t().unsqueeze(0)
+            else:
+                # Assume [batch, hidden_size] -> [batch, 1, hidden_size]
+                if hidden_states.shape[1] == hidden_size:
+                    hidden_states = hidden_states.unsqueeze(1)
+                else:
+                    raise ValueError(f"2D input shape {hidden_states.shape} incompatible with hidden_size {hidden_size}")
+                    
+        elif hidden_states.dim() == 3:
+            # Already correct shape [batch, seq_len, hidden_size]
+            if hidden_states.shape[-1] != hidden_size:
+                raise ValueError(f"Hidden size mismatch: expected {hidden_size}, got {hidden_states.shape[-1]}")
+        else:
+            raise ValueError(f"Unexpected input dimensions: {hidden_states.dim()}D, shape {hidden_states.shape}")
+        
+        # Final validation
+        if hidden_states.shape[-1] != hidden_size:
+            raise ValueError(f"Final hidden size mismatch: expected {hidden_size}, got {hidden_states.shape[-1]}")
+        
+        return hidden_states
+    
     def construct_transformer_layer(self,
                                    layer_idx: int,
                                    weights: Dict[str, torch.Tensor]) -> nn.Module:
@@ -343,6 +403,10 @@ class SequentialModelLoader:
                 self.hidden_size = hidden_size
                 self.intermediate_size = intermediate_size
                 self.num_heads = num_heads
+                
+                # Add input validation
+                assert hidden_size % num_heads == 0, f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
+                self.head_dim = hidden_size // num_heads
                 
                 # Attention components
                 self.input_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
@@ -362,27 +426,55 @@ class SequentialModelLoader:
                 })
             
             def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-                """Minimal forward pass for calibration
+                """Forward pass with simplified but functional attention
                 
-                This is simplified but functional - enough to:
-                1. Pass activations through all weights
-                2. Maintain residual connections
-                3. Apply layer norms
+                Computes actual attention scores for realistic activation flow
                 """
+                # Validate and reshape input
+                if hasattr(self, '_parent_loader'):
+                    hidden_states = self._parent_loader._validate_and_reshape_input(hidden_states, self.hidden_size)
+                
+                # Ensure we have proper shape
+                if hidden_states.dim() != 3:
+                    if hidden_states.dim() == 2:
+                        hidden_states = hidden_states.unsqueeze(0)
+                    else:
+                        raise ValueError(f"Expected 3D input, got {hidden_states.dim()}D")
+                
+                batch_size, seq_len, hidden_size = hidden_states.shape
                 residual = hidden_states
                 
                 # Input layer norm
                 normed = self.input_layernorm(hidden_states)
                 
-                # Simplified attention (no actual attention computation)
-                # Just pass through projections to activate weights
+                # Compute Q, K, V projections
                 q = self.attention['q_proj'](normed)
                 k = self.attention['k_proj'](normed)  
                 v = self.attention['v_proj'](normed)
                 
-                # Simple attention output - just use V projection
-                # In real implementation would compute attention scores
-                attn_output = self.attention['o_proj'](v)
+                # Reshape for attention computation
+                # [batch, seq, hidden] -> [batch, heads, seq, head_dim]
+                head_dim = hidden_size // self.num_heads
+                q = q.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+                k = k.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+                v = v.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+                
+                # Compute attention scores (simplified - no causal mask)
+                scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
+                
+                # Apply softmax to get attention weights
+                attn_weights = torch.softmax(scores, dim=-1)
+                
+                # Apply attention to values
+                attn_output = torch.matmul(attn_weights, v)
+                
+                # Reshape back to [batch, seq, hidden]
+                attn_output = attn_output.transpose(1, 2).contiguous().view(
+                    batch_size, seq_len, hidden_size
+                )
+                
+                # Output projection
+                attn_output = self.attention['o_proj'](attn_output)
                 
                 # Residual connection
                 hidden_states = residual + attn_output
@@ -391,9 +483,11 @@ class SequentialModelLoader:
                 # Post-attention layer norm
                 normed = self.post_attention_layernorm(hidden_states)
                 
-                # MLP with GLM-style gated activation
-                gate = torch.sigmoid(self.mlp['gate_proj'](normed))
+                # MLP with GLM-style gated activation (SwiGLU)
+                gate = self.mlp['gate_proj'](normed)
                 up = self.mlp['up_proj'](normed)
+                # Use SiLU (Swish) activation for gate as in GLM
+                gate = gate * torch.sigmoid(gate)
                 mlp_output = self.mlp['down_proj'](gate * up)
                 
                 # Final residual connection
@@ -407,6 +501,9 @@ class SequentialModelLoader:
             intermediate_size=self.intermediate_size,
             num_heads=self.num_attention_heads
         )
+        
+        # Store layer name for reference
+        layer._layer_name = f"transformer.layers.{layer_idx}"
         
         # Load weights into the module
         for weight_name, weight_tensor in weights.items():
@@ -474,6 +571,12 @@ class SequentialModelLoader:
                 self.intermediate_size = intermediate_size
                 self.num_experts = num_experts
                 self.num_shared_experts = num_shared_experts
+                self.num_heads = num_heads
+                
+                # Add input validation
+                assert hidden_size % num_heads == 0, f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
+                self.head_dim = hidden_size // num_heads
+                assert num_experts > 0, f"num_experts must be positive, got {num_experts}"
                 
                 # Attention components (same as transformer)
                 self.input_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
@@ -510,20 +613,48 @@ class SequentialModelLoader:
                         self.shared_experts.append(expert)
             
             def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-                """Minimal forward pass for MoE layer
+                """Forward pass for MoE layer with proper routing
                 
-                Simplified but functional MoE forward pass
+                Implements actual expert selection and weighted combination
                 """
+                # Validate and reshape input
+                if hasattr(self, '_parent_loader'):
+                    hidden_states = self._parent_loader._validate_and_reshape_input(hidden_states, self.hidden_size)
+                
+                # Ensure we have proper shape
+                if hidden_states.dim() != 3:
+                    if hidden_states.dim() == 2:
+                        hidden_states = hidden_states.unsqueeze(0)
+                    else:
+                        raise ValueError(f"Expected 3D input, got {hidden_states.dim()}D")
+                
+                batch_size, seq_len, hidden_size = hidden_states.shape
                 residual = hidden_states
                 
                 # Input layer norm
                 normed = self.input_layernorm(hidden_states)
                 
-                # Simplified attention (same as regular transformer)
+                # Attention computation (same as TransformerLayer)
                 q = self.attention['q_proj'](normed)
                 k = self.attention['k_proj'](normed)  
                 v = self.attention['v_proj'](normed)
-                attn_output = self.attention['o_proj'](v)
+                
+                # Reshape for attention
+                head_dim = hidden_size // self.num_heads
+                q = q.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+                k = k.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+                v = v.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+                
+                # Compute attention
+                scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
+                attn_weights = torch.softmax(scores, dim=-1)
+                attn_output = torch.matmul(attn_weights, v)
+                
+                # Reshape back
+                attn_output = attn_output.transpose(1, 2).contiguous().view(
+                    batch_size, seq_len, hidden_size
+                )
+                attn_output = self.attention['o_proj'](attn_output)
                 
                 # Residual connection
                 hidden_states = residual + attn_output
@@ -532,33 +663,64 @@ class SequentialModelLoader:
                 # Post-attention layer norm
                 normed = self.post_attention_layernorm(hidden_states)
                 
-                # MoE routing (simplified - just use top-2 experts)
-                router_logits = self.router(normed)
+                # MoE routing
+                router_logits = self.router(normed)  # [batch, seq, num_experts]
                 router_probs = torch.softmax(router_logits, dim=-1)
                 
-                # Get top-k experts (simplified to top-2)
+                # Get top-k experts (use top-2 for efficiency)
                 top_k = min(2, self.num_experts)
                 topk_probs, topk_indices = torch.topk(router_probs, top_k, dim=-1)
                 
                 # Normalize top-k probabilities
-                topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+                topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-6)
                 
-                # Apply experts (simplified - just use first expert)
-                if self.num_experts > 0:
-                    expert = self.experts[0]
-                    gate = torch.sigmoid(expert['gate_proj'](normed))
-                    up = expert['up_proj'](normed)
-                    expert_output = expert['down_proj'](gate * up)
-                else:
-                    expert_output = normed
+                # Flatten for expert processing
+                normed_flat = normed.view(-1, hidden_size)  # [batch*seq, hidden]
+                topk_indices_flat = topk_indices.view(-1, top_k)  # [batch*seq, k]
+                topk_probs_flat = topk_probs.view(-1, top_k)  # [batch*seq, k]
                 
-                # Apply shared experts if available
+                # Initialize expert output
+                expert_output = torch.zeros_like(normed_flat)
+                
+                # Apply selected experts with proper weighting
+                for expert_idx in range(self.num_experts):
+                    # Find tokens that selected this expert
+                    expert_mask = (topk_indices_flat == expert_idx).any(dim=-1)
+                    
+                    if expert_mask.any():
+                        expert = self.experts[expert_idx]
+                        expert_input = normed_flat[expert_mask]
+                        
+                        # Compute expert output
+                        gate = expert['gate_proj'](expert_input)
+                        up = expert['up_proj'](expert_input)
+                        gate = gate * torch.sigmoid(gate)  # SwiGLU activation
+                        expert_out = expert['down_proj'](gate * up)
+                        
+                        # Get weights for this expert
+                        expert_weights = torch.zeros(len(normed_flat), device=normed.device)
+                        for k in range(top_k):
+                            mask_k = topk_indices_flat[:, k] == expert_idx
+                            expert_weights[mask_k] = topk_probs_flat[mask_k, k]
+                        
+                        # Add weighted expert output
+                        expert_output[expert_mask] += expert_out * expert_weights[expert_mask].unsqueeze(-1)
+                
+                # Reshape back to [batch, seq, hidden]
+                expert_output = expert_output.view(batch_size, seq_len, hidden_size)
+                
+                # Apply shared experts if available (always active)
                 if self.num_shared_experts > 0 and hasattr(self, 'shared_experts'):
-                    shared_expert = self.shared_experts[0]
-                    gate = torch.sigmoid(shared_expert['gate_proj'](normed))
-                    up = shared_expert['up_proj'](normed)
-                    shared_output = shared_expert['down_proj'](gate * up)
-                    expert_output = expert_output + shared_output
+                    shared_output = torch.zeros_like(normed)
+                    for shared_expert in self.shared_experts:
+                        gate = shared_expert['gate_proj'](normed)
+                        up = shared_expert['up_proj'](normed)
+                        gate = gate * torch.sigmoid(gate)
+                        shared_out = shared_expert['down_proj'](gate * up)
+                        shared_output += shared_out / self.num_shared_experts
+                    
+                    # Combine routed and shared experts
+                    expert_output = expert_output * 0.5 + shared_output * 0.5
                 
                 # Final residual connection
                 hidden_states = residual + expert_output

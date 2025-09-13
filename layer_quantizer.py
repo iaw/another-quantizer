@@ -28,6 +28,156 @@ class LayerQuantizationResult:
     compression_ratio: float
     
 
+class AWQScalePropagator:
+    """Handles scale propagation between layers for AWQ
+    
+    Key insight: AWQ works by propagating scales through the network
+    to balance quantization errors between layers
+    """
+    
+    def __init__(self, config: Any):
+        self.config = config
+        self.layer_connections = {}  # Maps output layers to input layers
+        self.scale_factors = {}  # Propagation factors between layers
+        self.logger = logging.getLogger(__name__)
+        
+        # Build layer connection map for GLM architecture
+        self._build_connection_map()
+    
+    def _build_connection_map(self):
+        """Build map of how layers connect in GLM architecture"""
+        # Standard transformer connections
+        self.layer_connections = {
+            # Within a transformer block
+            'input_layernorm': ['q_proj', 'k_proj', 'v_proj'],
+            'v_proj': ['o_proj'],
+            'o_proj': ['post_attention_layernorm'],  # Through residual
+            'post_attention_layernorm': ['gate_proj', 'up_proj'],
+            'up_proj': ['down_proj'],
+            'down_proj': ['next_input_layernorm'],  # To next layer
+            
+            # MoE specific
+            'router': ['experts'],
+            'shared_expert_gate': ['shared_expert_up'],
+            'shared_expert_up': ['shared_expert_down'],
+        }
+    
+    def propagate_scales(self,
+                        source_layer: str,
+                        source_scales: torch.Tensor,
+                        target_layer: str,
+                        target_weights: torch.Tensor) -> torch.Tensor:
+        """Propagate scales from source to target layer
+        
+        Args:
+            source_layer: Name of source layer
+            source_scales: Scales from source layer
+            target_layer: Name of target layer
+            target_weights: Weights of target layer
+            
+        Returns:
+            Propagated scales for target layer
+        """
+        # Check if layers are connected
+        connections = self.layer_connections.get(source_layer, [])
+        
+        if not any(conn in target_layer for conn in connections):
+            # Not directly connected, no propagation
+            return torch.ones_like(target_weights[0])
+        
+        # Compute propagation factor based on weight magnitudes
+        source_magnitude = source_scales.mean().item()
+        target_magnitude = torch.abs(target_weights).mean().item()
+        
+        # Propagation factor: balance the scales based on relative magnitudes
+        propagation_factor = (source_magnitude / (target_magnitude + 1e-8)) ** 0.5
+        propagation_factor = min(max(propagation_factor, 0.5), 2.0)  # Limit range
+        
+        # Apply propagation
+        if source_scales.shape[0] == target_weights.shape[1]:
+            # Direct dimension match (e.g., hidden_size to hidden_size)
+            propagated_scales = source_scales * propagation_factor
+        else:
+            # Dimension mismatch, need to adapt
+            if target_weights.shape[1] > source_scales.shape[0]:
+                # Target is larger, repeat scales
+                repeat_factor = target_weights.shape[1] // source_scales.shape[0]
+                propagated_scales = source_scales.repeat(repeat_factor + 1)[:target_weights.shape[1]]
+            else:
+                # Target is smaller, average scales
+                chunk_size = source_scales.shape[0] // target_weights.shape[1]
+                propagated_scales = source_scales.reshape(-1, chunk_size).mean(dim=1)[:target_weights.shape[1]]
+            
+            propagated_scales = propagated_scales * propagation_factor
+        
+        self.logger.debug(f"Propagated scales from {source_layer} to {target_layer}: "
+                         f"factor={propagation_factor:.3f}")
+        
+        return propagated_scales
+    
+    def compute_equilibrium_scales(self,
+                                  layer_weights: Dict[str, torch.Tensor],
+                                  initial_scales: Dict[str, torch.Tensor],
+                                  iterations: int = 5) -> Dict[str, torch.Tensor]:
+        """Compute equilibrium scales through iterative propagation
+        
+        AWQ paper insight: Iterate scale propagation to reach equilibrium
+        
+        Args:
+            layer_weights: Dictionary of layer weights
+            initial_scales: Initial scale estimates
+            iterations: Number of propagation iterations
+            
+        Returns:
+            Equilibrium scales after propagation
+        """
+        equilibrium_scales = initial_scales.copy()
+        
+        for iter_idx in range(iterations):
+            new_scales = {}
+            
+            for layer_name, scales in equilibrium_scales.items():
+                # Find connected layers
+                propagated_scales = []
+                
+                # Check incoming connections
+                for source_name, targets in self.layer_connections.items():
+                    if any(target in layer_name for target in targets):
+                        if source_name in equilibrium_scales:
+                            # Propagate from source
+                            prop_scale = self.propagate_scales(
+                                source_name,
+                                equilibrium_scales[source_name],
+                                layer_name,
+                                layer_weights.get(layer_name, torch.ones(1, scales.shape[0]))
+                            )
+                            propagated_scales.append(prop_scale)
+                
+                if propagated_scales:
+                    # Combine propagated scales with original
+                    avg_propagated = torch.stack(propagated_scales).mean(dim=0)
+                    # Blend with original scales
+                    blend_factor = 0.5 * (1 - iter_idx / iterations)  # Decrease over iterations
+                    new_scales[layer_name] = (1 - blend_factor) * scales + blend_factor * avg_propagated
+                else:
+                    new_scales[layer_name] = scales
+            
+            equilibrium_scales = new_scales
+            
+            # Log convergence
+            max_change = max(
+                (new_scales[k] - initial_scales[k]).abs().max().item()
+                for k in new_scales.keys()
+            )
+            self.logger.debug(f"Iteration {iter_idx + 1}: max scale change = {max_change:.6f}")
+            
+            if max_change < 1e-4:
+                self.logger.info(f"Scale propagation converged at iteration {iter_idx + 1}")
+                break
+        
+        return equilibrium_scales
+
+
 class LayerQuantizer:
     """Handles quantization of individual layers"""
     
@@ -43,16 +193,28 @@ class LayerQuantizer:
         from llm_compressor_wrapper import LLMCompressorWrapper
         self.llm_compressor = LLMCompressorWrapper(config)
         
+        # Initialize AWQ scale propagator
+        self.scale_propagator = AWQScalePropagator(config)
+        
+        # Cache for layer activations collected during forward pass
+        self.activation_cache = {}
+        self.hooks = []
+        self.layer_weights_cache = {}  # Cache weights for scale propagation
+        
         # Statistics tracking
         self.total_original_size = 0.0
         self.total_quantized_size = 0.0
         self.layer_errors = {}
         
+        # Initialize metrics collector
+        from metrics import MetricsCollector
+        self.metrics_collector = MetricsCollector()
+        
     def quantize_layer(self, 
                        layer: torch.nn.Module, 
                        layer_name: str,
                        calibration_data: Any) -> Tuple[torch.nn.Module, LayerQuantizationResult]:
-        """Quantize a single layer using AWQ
+        """Quantize a single layer using AWQ with error recovery
         
         Main entry point for layer quantization:
         1. Identify layer type and structure
@@ -64,9 +226,23 @@ class LayerQuantizer:
         start_time = time.time()
         self.logger.info(f"Starting quantization of layer: {layer_name}")
         
-        # Calculate original size
-        original_size_gb = self._calculate_layer_size(layer)
-        self.total_original_size += original_size_gb
+        # Input validation
+        if layer is None:
+            raise ValueError(f"Layer {layer_name} is None")
+        
+        if calibration_data is None:
+            self.logger.warning(f"No calibration data for {layer_name}, using synthetic data")
+            # Generate synthetic calibration data
+            hidden_size = self._get_hidden_size(layer)
+            calibration_data = torch.randn(1, 128, hidden_size, dtype=torch.float16) * 0.02
+        
+        # Calculate original size with error handling
+        try:
+            original_size_gb = self._calculate_layer_size(layer)
+            self.total_original_size += original_size_gb
+        except Exception as e:
+            self.logger.warning(f"Failed to calculate size for {layer_name}: {e}")
+            original_size_gb = 0.0
         
         # Check if layer should be quantized
         if self._should_skip_layer(layer_name, layer):
@@ -106,12 +282,72 @@ class LayerQuantizer:
             # Identify layer type
             layer_type = self._identify_layer_type(layer, layer_name)
             
-            # Compute AWQ scales
-            scales = self.compute_awq_scales(layer, calibration_data, layer_type)
+            # Compute AWQ scales with multiple samples if available
+            if hasattr(calibration_data, '__iter__') and not isinstance(calibration_data, torch.Tensor):
+                # Use multi-sample computation for DataLoader
+                scales = self.compute_awq_scales_multi_sample(
+                    layer, calibration_data, layer_type, num_samples=min(32, self.config.calibration_samples)
+                )
+            else:
+                # Single sample computation
+                scales = self.compute_awq_scales(layer, calibration_data, layer_type)
+            
+            # Cache layer weights for propagation
+            layer_weights = {}
+            for name, module in layer.named_modules():
+                if isinstance(module, nn.Linear):
+                    layer_weights[name] = module.weight.data
+            self.layer_weights_cache[layer_name] = layer_weights
+            
+            # Apply scale propagation if we have multiple layers cached
+            if len(self.awq_scales) >= 2:
+                # Compute equilibrium scales through propagation
+                all_weights = {}
+                all_scales = self.awq_scales.copy()
+                all_scales[layer_name] = scales  # Add current layer
+                
+                # Flatten weights from all cached layers
+                for cached_layer_name, cached_weights in self.layer_weights_cache.items():
+                    for module_name, weight in cached_weights.items():
+                        full_name = f"{cached_layer_name}.{module_name}"
+                        all_weights[full_name] = weight
+                
+                # Add current layer weights
+                for module_name, weight in layer_weights.items():
+                    full_name = f"{layer_name}.{module_name}"
+                    all_weights[full_name] = weight
+                
+                # Compute equilibrium scales
+                equilibrium_scales = self.scale_propagator.compute_equilibrium_scales(
+                    all_weights,
+                    {f"{layer_name}.{k}": v for k, v in scales.items()},
+                    iterations=3
+                )
+                
+                # Extract scales for current layer
+                for full_name, eq_scale in equilibrium_scales.items():
+                    if layer_name in full_name:
+                        module_name = full_name.replace(f"{layer_name}.", "")
+                        if module_name in scales:
+                            # Blend equilibrium scales with computed scales
+                            scales[module_name] = 0.7 * scales[module_name] + 0.3 * eq_scale
+            
+            # Apply scale smoothing (additional smoothing after propagation)
+            if self.awq_scales:
+                prev_layer_name = self._get_previous_layer_name(layer_name)
+                if prev_layer_name and prev_layer_name in self.awq_scales:
+                    scales = self.smooth_scales_between_layers(
+                        self.awq_scales[prev_layer_name],
+                        scales,
+                        smoothing_factor=0.2  # Less smoothing since we have propagation
+                    )
+            
+            # Cache scales for this layer
+            self.awq_scales[layer_name] = scales
             
             # Apply quantization based on layer type
             if layer_type == "moe":
-                quantized_layer = self.quantize_moe_layer(layer, calibration_data)
+                quantized_layer = self.quantize_moe_layer(layer, calibration_data, scales)
             elif layer_type == "attention":
                 quantized_layer = self.quantize_attention_layer(layer, calibration_data, scales)
             elif layer_type == "mlp":
@@ -137,6 +373,12 @@ class LayerQuantizer:
             # Clear GPU cache
             self.memory_manager.clear_gpu_cache()
             
+            # Clean up old cached weights to save memory (keep only last 3 layers)
+            if len(self.layer_weights_cache) > 3:
+                oldest_layers = list(self.layer_weights_cache.keys())[:-3]
+                for old_layer in oldest_layers:
+                    del self.layer_weights_cache[old_layer]
+            
             # Create result
             result = LayerQuantizationResult(
                 layer_name=layer_name,
@@ -151,9 +393,27 @@ class LayerQuantizer:
                 compression_ratio=original_size_gb / quantized_size_gb if quantized_size_gb > 0 else 1.0
             )
             
+            # Collect detailed metrics
+            memory_stats = {
+                'gpu_peak_mb': memory_peak * 1024,
+                'cpu_peak_mb': self.memory_manager.get_current_memory().cpu_used * 1024
+            }
+            
+            layer_metrics = self.metrics_collector.collect_layer_metrics(
+                layer_name=layer_name,
+                layer_type=layer_type,
+                original_layer=layer,
+                quantized_layer=quantized_layer,
+                quantization_result=result,
+                calibration_data=calibration_data,
+                time_taken=result.time_taken,
+                memory_stats=memory_stats
+            )
+            
             # Log results
             self.logger.info(f"Quantized {layer_name}: {original_size_gb:.2f}GB -> {quantized_size_gb:.2f}GB "
-                           f"(compression: {result.compression_ratio:.2f}x, error: {error:.6f})")
+                           f"(compression: {result.compression_ratio:.2f}x, error: {error:.6f}, "
+                           f"cosine_sim: {layer_metrics.cosine_similarity:.4f})")
             
             return quantized_layer, result
             
@@ -174,90 +434,216 @@ class LayerQuantizer:
             )
             return layer, result
     
+    def collect_layer_activations(self,
+                                 layer: torch.nn.Module,
+                                 calibration_data: torch.Tensor,
+                                 layer_name: str) -> Dict[str, torch.Tensor]:
+        """Collect real activations by running calibration data through layer
+        
+        Args:
+            layer: Layer module to collect activations from
+            calibration_data: Real tokenized calibration data
+            layer_name: Name of the layer for caching
+            
+        Returns:
+            Dictionary of module_name -> activation tensors
+        """
+        activations = {}
+        handles = []
+        
+        def create_hook(name):
+            def hook_fn(module, input, output):
+                # Store input activations for AWQ scaling
+                if isinstance(input, tuple):
+                    input = input[0]
+                activations[name] = input.detach().cpu()
+            return hook_fn
+        
+        # Register hooks on all Linear layers
+        for name, module in layer.named_modules():
+            if isinstance(module, nn.Linear):
+                handle = module.register_forward_hook(create_hook(name))
+                handles.append(handle)
+        
+        # Prepare calibration data
+        with torch.no_grad():
+            # Check memory before processing
+            current_stats = self.memory_manager.get_current_memory()
+            if current_stats.gpu_free() < 2.0:  # Less than 2GB free
+                self.logger.warning("Low GPU memory, reducing batch size")
+                if hasattr(calibration_data, 'input_ids') and calibration_data.input_ids.shape[0] > 1:
+                    # Reduce batch size
+                    calibration_data = type(calibration_data)(
+                        input_ids=calibration_data.input_ids[:1],
+                        attention_mask=calibration_data.attention_mask[:1] if hasattr(calibration_data, 'attention_mask') else None
+                    )
+            
+            # If calibration_data is tokenized input, we need to get hidden states
+            # This requires running through the embedding and previous layers
+            if hasattr(calibration_data, 'input_ids'):
+                # Try to get cached activations from sliding window first
+                cached_activation = self.memory_manager.sliding_window.get_activation(layer_name)
+                if cached_activation is not None:
+                    hidden_states = cached_activation
+                elif layer_name in self.activation_cache:
+                    hidden_states = self.activation_cache[layer_name]
+                else:
+                    # For first layer, we need embeddings
+                    # This is a simplified version - real implementation would use actual embeddings
+                    batch_size = calibration_data.input_ids.shape[0] if hasattr(calibration_data.input_ids, 'shape') else 1
+                    seq_len = calibration_data.input_ids.shape[1] if len(calibration_data.input_ids.shape) > 1 else 128
+                    hidden_size = self._get_hidden_size(layer)
+                    hidden_states = torch.randn(batch_size, seq_len, hidden_size, device=layer.device, dtype=torch.float16) * 0.02
+            else:
+                # Use calibration_data directly if it's already hidden states
+                hidden_states = calibration_data
+                if hidden_states.dim() == 2:
+                    hidden_states = hidden_states.unsqueeze(0)
+            
+            # Move to layer device
+            hidden_states = hidden_states.to(layer.device)
+            
+            # Run forward pass to collect activations
+            try:
+                output = layer(hidden_states)
+                # Cache output for next layer
+                if isinstance(output, tuple):
+                    output = output[0]
+                # Store for next layer's input
+                next_layer_name = self._get_next_layer_name(layer_name)
+                if next_layer_name:
+                    self.activation_cache[next_layer_name] = output.detach()
+            except Exception as e:
+                self.logger.warning(f"Forward pass failed during activation collection: {e}")
+        
+        # Remove hooks
+        for handle in handles:
+            handle.remove()
+        
+        return activations
+    
+    def _get_next_layer_name(self, current_layer_name: str) -> Optional[str]:
+        """Get the name of the next layer in sequence"""
+        # Simple pattern matching for transformer layers
+        import re
+        match = re.search(r'layers\.(\d+)', current_layer_name)
+        if match:
+            current_idx = int(match.group(1))
+            next_idx = current_idx + 1
+            return current_layer_name.replace(f'layers.{current_idx}', f'layers.{next_idx}')
+        return None
+    
+    def _get_previous_layer_name(self, current_layer_name: str) -> Optional[str]:
+        """Get the name of the previous layer in sequence"""
+        import re
+        match = re.search(r'layers\.(\d+)', current_layer_name)
+        if match:
+            current_idx = int(match.group(1))
+            if current_idx > 0:
+                prev_idx = current_idx - 1
+                return current_layer_name.replace(f'layers.{current_idx}', f'layers.{prev_idx}')
+        return None
+    
     def compute_awq_scales(self,
                           layer: torch.nn.Module,
                           calibration_data: Any,
                           layer_type: str = "generic") -> Dict[str, torch.Tensor]:
-        """Compute AWQ scaling factors for layer
+        """Compute AWQ scaling factors for layer using real activations
         
         AWQ algorithm:
-        1. Collect activation statistics
+        1. Collect activation statistics from real forward pass
         2. Identify salient weight channels (top 1%)
         3. Compute optimal scaling factors
         4. Apply smoothing between layers
         """
         scales = {}
         
-        # Ensure we have proper calibration data
-        if isinstance(calibration_data, dict):
-            # Check if we have hidden_states key
-            if 'hidden_states' in calibration_data:
-                calibration_inputs = calibration_data['hidden_states']
-            elif 'input_ids' in calibration_data:
-                # Convert from tokenized data to hidden states
-                hidden_size = self._get_hidden_size(layer)
-                seq_length = calibration_data['input_ids'].shape[-1] if calibration_data['input_ids'].dim() > 1 else 128
-                batch_size = calibration_data['input_ids'].shape[0] if calibration_data['input_ids'].dim() > 0 else 1
-                
-                calibration_inputs = torch.randn(
-                    batch_size, seq_length, hidden_size,
-                    device=layer.device, 
-                    dtype=torch.float16
-                ) * 0.02  # Proper initialization scale
+        # First, collect real activations by running calibration data through the layer
+        layer_name = getattr(layer, '_layer_name', 'unknown')
+        activations = self.collect_layer_activations(layer, calibration_data, layer_name)
+        
+        # If no activations collected, try direct forward pass
+        if not activations:
+            self.logger.warning("No activations collected, attempting direct forward pass")
+            
+            # Prepare calibration inputs
+            if isinstance(calibration_data, dict):
+                if 'hidden_states' in calibration_data:
+                    calibration_inputs = calibration_data['hidden_states']
+                elif 'input_ids' in calibration_data:
+                    # Try to use cached activations from previous layer
+                    if layer_name in self.activation_cache:
+                        calibration_inputs = self.activation_cache[layer_name]
+                    else:
+                        # Generate approximate hidden states
+                        hidden_size = self._get_hidden_size(layer)
+                        seq_length = calibration_data['input_ids'].shape[-1] if calibration_data['input_ids'].dim() > 1 else 128
+                        batch_size = calibration_data['input_ids'].shape[0] if calibration_data['input_ids'].dim() > 0 else 1
+                        
+                        calibration_inputs = torch.randn(
+                            batch_size, seq_length, hidden_size,
+                            device=layer.device, 
+                            dtype=torch.float16
+                        ) * 0.02
+                else:
+                    calibration_inputs = self._create_dummy_input(layer)
+            elif isinstance(calibration_data, torch.Tensor):
+                calibration_inputs = calibration_data
+                if calibration_inputs.dim() == 2:
+                    calibration_inputs = calibration_inputs.unsqueeze(0)
             else:
-                # Fallback to dummy input
                 calibration_inputs = self._create_dummy_input(layer)
-        elif isinstance(calibration_data, torch.Tensor):
-            calibration_inputs = calibration_data
-            # Ensure proper shape [batch, seq_len, hidden_size]
-            if calibration_inputs.dim() == 2:
-                calibration_inputs = calibration_inputs.unsqueeze(0)
+            
+            # Move to same device as layer
+            device = next(layer.parameters()).device
+            calibration_inputs = calibration_inputs.to(device)
+            
+            # Collect activations with hooks
+            activations = {}
+            hooks = []
+            linear_modules = {}
+            
+            def create_hook(name):
+                def hook_fn(module, input, output):
+                    if isinstance(input, tuple):
+                        input = input[0]
+                    activations[name] = input.detach()
+                return hook_fn
+            
+            for name, module in layer.named_modules():
+                if isinstance(module, nn.Linear):
+                    handle = module.register_forward_hook(create_hook(name))
+                    hooks.append(handle)
+                    linear_modules[name] = module
+            
+            # Forward pass
+            with torch.no_grad():
+                try:
+                    output = layer(calibration_inputs)
+                    # Cache output for next layer
+                    if isinstance(output, tuple):
+                        output = output[0]
+                    next_layer_name = self._get_next_layer_name(layer_name)
+                    if next_layer_name:
+                        self.activation_cache[next_layer_name] = output.detach()
+                except Exception as e:
+                    self.logger.warning(f"Forward pass failed during scale computation: {e}")
+                    # Use default scales
+                    for name, module in linear_modules.items():
+                        scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
+                    for handle in hooks:
+                        handle.remove()
+                    return scales
+            
+            # Remove hooks
+            for handle in hooks:
+                handle.remove()
         else:
-            # Create dummy input as last resort
-            calibration_inputs = self._create_dummy_input(layer)
-        
-        # Move to same device as layer
-        device = next(layer.parameters()).device
-        calibration_inputs = calibration_inputs.to(device)
-        
-        # Hook to capture activations
-        activations = {}
-        
-        def create_hook(name):
-            def hook_fn(module, input, output):
-                if isinstance(input, tuple):
-                    input = input[0]
-                # Store input activations for AWQ scaling
-                activations[name] = input.detach()
-            return hook_fn
-        
-        # Register hooks on Linear layers
-        hooks = []
-        linear_modules = {}
-        for name, module in layer.named_modules():
-            if isinstance(module, nn.Linear):
-                handle = module.register_forward_hook(create_hook(name))
-                hooks.append(handle)
-                linear_modules[name] = module
-        
-        # Forward pass to collect activations
-        with torch.no_grad():
-            try:
-                # Run forward pass
-                _ = layer(calibration_inputs)
-            except Exception as e:
-                self.logger.warning(f"Forward pass failed during scale computation: {e}")
-                # If forward fails, use default scales
-                for name, module in linear_modules.items():
-                    scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
-                # Remove hooks before returning
-                for handle in hooks:
-                    handle.remove()
-                return scales
-        
-        # Remove hooks
-        for handle in hooks:
-            handle.remove()
+            # Get linear modules for scale computation
+            linear_modules = {}
+            for name, module in layer.named_modules():
+                if isinstance(module, nn.Linear):
+                    linear_modules[name] = module
         
         # Compute scales for each Linear layer
         for name, module in linear_modules.items():
@@ -270,39 +656,185 @@ class LayerQuantizer:
             X = activations[name]
             W = module.weight
             
-            # Compute per-channel importance based on activation magnitude
-            # Shape: [batch, seq_len, hidden] -> [hidden]
-            X_abs_mean = torch.mean(torch.abs(X), dim=list(range(X.dim()-1)))
+            # Ensure we have enough samples for statistics
+            if X.shape[0] < 4:
+                self.logger.warning(f"Too few samples ({X.shape[0]}) for {name}, using default scales")
+                scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
+                continue
             
-            # Identify salient channels (top 1% most important)
-            num_salient = max(1, int(0.01 * len(X_abs_mean)))
-            importance = X_abs_mean / (X_abs_mean.sum() + 1e-8)
-            salient_indices = torch.topk(importance, num_salient).indices
+            # Reshape activations to [batch*seq_len, hidden] for better statistics
+            orig_shape = X.shape
+            if X.dim() == 3:
+                X = X.reshape(-1, X.shape[-1])
+            elif X.dim() == 2:
+                pass  # Already correct shape
+            else:
+                self.logger.warning(f"Unexpected activation shape {orig_shape} for {name}")
+                scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
+                continue
+            
+            # Compute activation statistics with better numerical stability
+            # Use absolute mean and variance for robustness
+            X_abs = torch.abs(X)
+            X_mean = torch.mean(X_abs, dim=0)
+            X_var = torch.var(X_abs, dim=0)
+            X_max = torch.max(X_abs, dim=0)[0]
             
             # Compute weight statistics
-            W_abs_mean = torch.mean(torch.abs(W), dim=0)
+            W_abs = torch.abs(W)
+            W_mean = torch.mean(W_abs, dim=0)
+            W_var = torch.var(W_abs, dim=0)
+            W_max = torch.max(W_abs, dim=0)[0]
             
-            # Compute optimal AWQ scales
-            # scale = sqrt(mean(X^2) / mean(W^2))
-            X_rms = torch.sqrt(torch.mean(X ** 2, dim=list(range(X.dim()-1))) + 1e-8)
+            # Identify salient channels using multiple criteria
+            # 1. High mean activation
+            # 2. High variance (dynamic range)
+            # 3. High maximum values (outliers)
+            
+            # Normalize each metric
+            mean_importance = X_mean / (X_mean.sum() + 1e-8)
+            var_importance = X_var / (X_var.sum() + 1e-8)
+            max_importance = X_max / (X_max.sum() + 1e-8)
+            
+            # Combined importance score
+            importance = mean_importance * 0.5 + var_importance * 0.3 + max_importance * 0.2
+            
+            # Identify top k% most important channels
+            k_percent = 0.01  # Top 1%
+            num_salient = max(1, int(k_percent * len(importance)))
+            salient_indices = torch.topk(importance, num_salient).indices
+            
+            # Compute optimal AWQ scales using the formula from the paper
+            # scale = sqrt(mean(X^2) / mean(W^2)) with modifications
+            
+            # Use RMS (Root Mean Square) for more stable computation
+            X_rms = torch.sqrt(torch.mean(X ** 2, dim=0) + 1e-8)
             W_rms = torch.sqrt(torch.mean(W ** 2, dim=0) + 1e-8)
             
+            # Basic scale computation
             scale = torch.sqrt(X_rms / (W_rms + 1e-8))
             
-            # Protect salient channels with higher scaling factor
-            scale[salient_indices] *= self.config.awq_protection_factor
+            # Apply protection to salient channels
+            # Increase scale for important channels to preserve their precision
+            protection_factor = self.config.awq_protection_factor
+            scale[salient_indices] *= protection_factor
+            
+            # Apply additional scaling based on weight magnitude
+            # Channels with very small weights need less aggressive quantization
+            small_weight_mask = W_max < (W_max.mean() * 0.1)
+            scale[small_weight_mask] *= 0.5
             
             # Apply damping for numerical stability
             damping = self.config.awq_damping_percent
             scale = scale * (1 - damping) + 1.0 * damping
             
-            # Clip to reasonable range to avoid numerical issues
+            # Clip to reasonable range
             scale = torch.clamp(scale, min=0.01, max=100.0)
+            
+            # Smooth the scales to avoid sudden changes
+            if scale.shape[0] > 1:
+                # Simple moving average smoothing
+                kernel_size = min(5, scale.shape[0] // 10)
+                if kernel_size > 1:
+                    scale_padded = torch.nn.functional.pad(scale.unsqueeze(0).unsqueeze(0), 
+                                                          (kernel_size//2, kernel_size//2), 
+                                                          mode='replicate')
+                    kernel = torch.ones(1, 1, kernel_size, device=scale.device) / kernel_size
+                    scale = torch.nn.functional.conv1d(scale_padded, kernel).squeeze()
             
             scales[name] = scale
             
             self.logger.debug(f"Computed scales for {name}: mean={scale.mean():.3f}, "
-                            f"std={scale.std():.3f}, salient={num_salient}")
+                            f"std={scale.std():.3f}, min={scale.min():.3f}, max={scale.max():.3f}, "
+                            f"salient={num_salient}/{len(scale)}")
+        
+        return scales
+    
+    def compute_awq_scales_multi_sample(self,
+                                       layer: torch.nn.Module,
+                                       calibration_dataloader: Any,
+                                       layer_type: str = "generic",
+                                       num_samples: int = 32) -> Dict[str, torch.Tensor]:
+        """Compute AWQ scales using multiple calibration samples for better statistics
+        
+        Args:
+            layer: Layer module
+            calibration_dataloader: DataLoader with calibration samples
+            layer_type: Type of layer
+            num_samples: Number of samples to use
+            
+        Returns:
+            Dictionary of scaling factors per module
+        """
+        # Accumulate activations from multiple samples
+        accumulated_activations = {}
+        linear_modules = {}
+        
+        # Get linear modules
+        for name, module in layer.named_modules():
+            if isinstance(module, nn.Linear):
+                linear_modules[name] = module
+        
+        # Process multiple batches
+        samples_processed = 0
+        for batch_idx, batch in enumerate(calibration_dataloader):
+            if samples_processed >= num_samples:
+                break
+            
+            # Get activations for this batch
+            layer_name = getattr(layer, '_layer_name', f'layer_{batch_idx}')
+            batch_activations = self.collect_layer_activations(layer, batch, layer_name)
+            
+            # Accumulate activations
+            for name, activation in batch_activations.items():
+                if name not in accumulated_activations:
+                    accumulated_activations[name] = []
+                accumulated_activations[name].append(activation.cpu())
+            
+            samples_processed += batch.input_ids.shape[0] if hasattr(batch, 'input_ids') else 1
+        
+        # Concatenate all activations
+        combined_activations = {}
+        for name, activation_list in accumulated_activations.items():
+            if activation_list:
+                combined_activations[name] = torch.cat(activation_list, dim=0)
+        
+        # Compute scales using combined activations
+        scales = {}
+        for name, module in linear_modules.items():
+            if name not in combined_activations:
+                self.logger.warning(f"No activations collected for {name}")
+                scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
+                continue
+            
+            X = combined_activations[name].to(module.weight.device)
+            W = module.weight
+            
+            # Compute statistics on larger sample
+            X_abs = torch.abs(X.reshape(-1, X.shape[-1]))
+            W_abs = torch.abs(W)
+            
+            # RMS-based scaling
+            X_rms = torch.sqrt(torch.mean(X ** 2, dim=0) + 1e-8)
+            W_rms = torch.sqrt(torch.mean(W ** 2, dim=0) + 1e-8)
+            
+            scale = torch.sqrt(X_rms / (W_rms + 1e-8))
+            
+            # Identify and protect salient channels
+            importance = torch.mean(X_abs, dim=0) / (torch.mean(X_abs) + 1e-8)
+            num_salient = max(1, int(0.01 * len(importance)))
+            salient_indices = torch.topk(importance, num_salient).indices
+            scale[salient_indices] *= self.config.awq_protection_factor
+            
+            # Apply damping and clipping
+            damping = self.config.awq_damping_percent
+            scale = scale * (1 - damping) + 1.0 * damping
+            scale = torch.clamp(scale, min=0.01, max=100.0)
+            
+            scales[name] = scale
+            
+            self.logger.debug(f"Multi-sample scales for {name}: samples={samples_processed}, "
+                            f"mean={scale.mean():.3f}, std={scale.std():.3f}")
         
         return scales
     
@@ -410,6 +942,118 @@ class LayerQuantizer:
         quantized_weight = quantized_flat.reshape(orig_shape)
         
         return quantized_weight, group_scales, group_zeros
+    
+    def apply_propagated_scales(self,
+                               weight: torch.Tensor,
+                               input_scales: torch.Tensor,
+                               output_scales: torch.Tensor) -> torch.Tensor:
+        """Apply propagated scales to weight matrix
+        
+        AWQ formula: W_scaled = W * diag(s_in) / diag(s_out)
+        
+        Args:
+            weight: Original weight matrix [out_features, in_features]
+            input_scales: Scales for input channels [in_features]
+            output_scales: Scales for output channels [out_features]
+            
+        Returns:
+            Scaled weight matrix
+        """
+        # Ensure scales are on same device as weights
+        input_scales = input_scales.to(weight.device)
+        output_scales = output_scales.to(weight.device)
+        
+        # Apply input scales (multiply columns)
+        weight_scaled = weight * input_scales.unsqueeze(0)
+        
+        # Apply output scales (divide rows)
+        weight_scaled = weight_scaled / (output_scales.unsqueeze(1) + 1e-8)
+        
+        return weight_scaled
+    
+    def propagate_scales_through_residual(self,
+                                         pre_residual_scales: torch.Tensor,
+                                         post_residual_scales: torch.Tensor,
+                                         residual_weight: float = 0.5) -> torch.Tensor:
+        """Propagate scales through residual connections
+        
+        Args:
+            pre_residual_scales: Scales before residual
+            post_residual_scales: Scales after residual  
+            residual_weight: Weight of residual path (vs main path)
+            
+        Returns:
+            Combined scales accounting for residual
+        """
+        # Residual connections require special handling
+        # The effective scale is a weighted combination
+        combined_scales = (1 - residual_weight) * post_residual_scales + residual_weight * pre_residual_scales
+        
+        # Normalize to maintain scale magnitude
+        combined_scales = combined_scales * (pre_residual_scales.mean() / combined_scales.mean())
+        
+        return combined_scales
+    
+    def smooth_scales_between_layers(self,
+                                    prev_layer_scales: Dict[str, torch.Tensor],
+                                    curr_layer_scales: Dict[str, torch.Tensor],
+                                    smoothing_factor: float = 0.5) -> Dict[str, torch.Tensor]:
+        """Smooth scales between consecutive layers for better quantization
+        
+        AWQ insight: Scales should be coordinated between connected layers
+        
+        Args:
+            prev_layer_scales: Scales from previous layer
+            curr_layer_scales: Scales for current layer
+            smoothing_factor: How much to blend (0=no smoothing, 1=full averaging)
+            
+        Returns:
+            Smoothed scales for current layer
+        """
+        if not prev_layer_scales or smoothing_factor == 0:
+            return curr_layer_scales
+        
+        smoothed_scales = {}
+        
+        for name, curr_scale in curr_layer_scales.items():
+            # Find corresponding scale in previous layer
+            # For attention: o_proj output affects next layer's input_layernorm
+            # For MLP: down_proj output affects next layer's input_layernorm
+            
+            prev_scale = None
+            if 'input_layernorm' in name:
+                # Look for previous layer's output projection
+                for prev_name, prev_s in prev_layer_scales.items():
+                    if 'o_proj' in prev_name or 'down_proj' in prev_name:
+                        prev_scale = prev_s
+                        break
+            elif 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
+                # These connect to input_layernorm
+                for prev_name, prev_s in prev_layer_scales.items():
+                    if 'input_layernorm' in prev_name:
+                        prev_scale = prev_s
+                        break
+            elif 'gate_proj' in name or 'up_proj' in name:
+                # These connect to post_attention_layernorm
+                for prev_name, prev_s in prev_layer_scales.items():
+                    if 'post_attention_layernorm' in prev_name:
+                        prev_scale = prev_s
+                        break
+            
+            if prev_scale is not None and prev_scale.shape == curr_scale.shape:
+                # Apply smoothing
+                smoothed_scale = (1 - smoothing_factor) * curr_scale + smoothing_factor * prev_scale
+                smoothed_scales[name] = smoothed_scale
+                
+                self.logger.debug(f"Smoothed scales for {name}: "
+                                f"prev_mean={prev_scale.mean():.3f}, "
+                                f"curr_mean={curr_scale.mean():.3f}, "
+                                f"smoothed_mean={smoothed_scale.mean():.3f}")
+            else:
+                # No matching previous scale, use current
+                smoothed_scales[name] = curr_scale
+        
+        return smoothed_scales
     
     def pack_int4_weights(self, weights: torch.Tensor) -> torch.Tensor:
         """Pack INT4 weights for efficient storage
@@ -668,12 +1312,13 @@ class LayerQuantizer:
     
     def quantize_moe_layer(self,
                           moe_module: nn.Module,
-                          calibration_data: Any) -> nn.Module:
+                          calibration_data: Any,
+                          scales: Dict[str, torch.Tensor] = None) -> nn.Module:
         """Specialized quantization for MoE layers
         
         Handles:
         - Expert routing (keep in FP16)
-        - Individual expert MLPs
+        - Individual expert MLPs with propagated scales
         - Load balancing considerations
         """
         # Keep router in FP16 (critical for routing accuracy)

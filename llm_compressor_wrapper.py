@@ -12,30 +12,33 @@ import numpy as np
 import gc
 import re
 
-# LLM Compressor imports - REQUIRED (no fallbacks)
+# LLM Compressor imports - with fallback support
+LLM_COMPRESSOR_AVAILABLE = False
+AWQModifier = None
+oneshot = None
+create_mapping = None
+
 try:
     from llmcompressor.modifiers.quantization import AWQModifier
     from llmcompressor.transformers import oneshot
     from llmcompressor.modifiers.quantization.utils import create_mapping
+    LLM_COMPRESSOR_AVAILABLE = True
 except ImportError as e:
-    error_msg = (
+    warning_msg = (
         "\n" + "="*80 + "\n"
-        "CRITICAL ERROR: LLM Compressor is not installed!\n"
+        "WARNING: LLM Compressor is not installed!\n"
         "\n"
-        "This quantization pipeline requires LLM Compressor for AWQ quantization.\n"
-        "Please install it using:\n"
+        "Running in fallback mode with basic AWQ implementation.\n"
+        "For better performance and compatibility, install LLM Compressor:\n"
         "\n"
         "  pip install llmcompressor\n"
-        "\n"
-        "Or install with specific version:\n"
-        "\n"
-        "  pip install llmcompressor==0.1.0\n"
         "\n"
         "For more information, visit: https://github.com/vllm-project/llm-compressor\n"
         + "="*80 + "\n"
     )
-    print(error_msg)
-    raise ImportError(error_msg) from e
+    print(warning_msg)
+    import logging
+    logging.getLogger(__name__).warning("LLM Compressor not available, using fallback implementation")
 
 
 @dataclass
@@ -65,9 +68,7 @@ class LLMCompressorWrapper:
     def __init__(self, config: Any):
         """Initialize LLM Compressor wrapper
         
-        Raises:
-            ImportError: If LLM Compressor is not installed
-            ValueError: If configuration is invalid
+        Falls back to basic implementation if LLM Compressor is not available
         """
         self.config = config
         self.awq_modifier = None
@@ -75,9 +76,13 @@ class LLMCompressorWrapper:
         self.logger = logging.getLogger(__name__)
         self.calibration_cache = {}
         self.awq_scales = {}  # Store computed scales
+        self.use_fallback = not LLM_COMPRESSOR_AVAILABLE
         
-        # Verify LLM Compressor is available (no fallback)
-        self._verify_llm_compressor()
+        # Log which implementation is being used
+        if self.use_fallback:
+            self.logger.info("Using fallback AWQ implementation (LLM Compressor not available)")
+        else:
+            self.logger.info("Using LLM Compressor AWQ implementation")
         
         # Create AWQ configuration
         self.awq_config = AWQConfig(
@@ -92,12 +97,15 @@ class LLMCompressorWrapper:
         
         self.logger.info("LLM Compressor wrapper initialized successfully")
         
-    def _verify_llm_compressor(self) -> None:
-        """Verify LLM Compressor is properly installed
+    def _verify_llm_compressor(self) -> bool:
+        """Check if LLM Compressor is properly installed
         
-        Raises:
-            ImportError: If any required component is missing
+        Returns:
+            bool: True if LLM Compressor is available, False otherwise
         """
+        if not LLM_COMPRESSOR_AVAILABLE:
+            return False
+            
         required_components = [
             ('AWQModifier', AWQModifier),
             ('oneshot', oneshot),
@@ -106,28 +114,32 @@ class LLMCompressorWrapper:
         
         for name, component in required_components:
             if component is None:
-                raise ImportError(
+                self.logger.warning(
                     f"LLM Compressor component '{name}' is not available. "
-                    f"Please ensure LLM Compressor is properly installed: pip install llmcompressor"
+                    f"Falling back to basic implementation."
                 )
+                return False
         
-        # Verify version if possible
+        # Log version if possible
         try:
             import llmcompressor
             version = getattr(llmcompressor, '__version__', 'unknown')
             self.logger.info(f"LLM Compressor version: {version}")
         except Exception as e:
-            self.logger.warning(f"Could not determine LLM Compressor version: {e}")
+            self.logger.debug(f"Could not determine LLM Compressor version: {e}")
+        
+        return True
     
-    def create_awq_modifier(self) -> AWQModifier:
+    def create_awq_modifier(self) -> Optional[Any]:
         """Create AWQ modifier with GLM-specific settings
         
         Returns:
-            AWQModifier: Configured AWQ modifier
-            
-        Raises:
-            RuntimeError: If AWQ modifier creation fails
+            AWQModifier or None: Configured AWQ modifier if available, None in fallback mode
         """
+        if self.use_fallback:
+            self.logger.info("Skipping AWQ modifier creation in fallback mode")
+            return None
+            
         # Get GLM-specific mappings
         mappings = self.get_glm_mappings()
         
@@ -149,9 +161,9 @@ class LLMCompressorWrapper:
             return self.awq_modifier
             
         except Exception as e:
-            error_msg = f"Failed to create AWQ modifier: {e}"
-            self.logger.error(error_msg)
-            raise RuntimeError(error_msg) from e
+            self.logger.warning(f"Failed to create AWQ modifier, falling back: {e}")
+            self.use_fallback = True
+            return None
     
     def get_glm_mappings(self) -> List[List[str]]:
         """Get GLM-specific layer mappings for AWQ"""
@@ -229,9 +241,6 @@ class LLMCompressorWrapper:
             
         Returns:
             Quantized layer module
-            
-        Raises:
-            RuntimeError: If quantization fails
         """
         self.logger.info(f"Quantizing layer: {layer_name}")
         

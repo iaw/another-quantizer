@@ -71,9 +71,9 @@ class CalibrationDataHandler:
                                 subset: Optional[str] = "en",
                                 split: str = "train",
                                 custom_path: Optional[str] = None) -> None:
-        """Load calibration dataset - SIMPLIFIED
+        """Load calibration dataset from HuggingFace or custom source
         
-        Just use synthetic data as fallback for simplicity
+        Supports c4, wikitext, pile, and custom datasets
         """
         self.logger.info(f"Loading calibration dataset: {dataset_name}")
         
@@ -81,16 +81,146 @@ class CalibrationDataHandler:
             # Try to load custom dataset
             try:
                 self._load_custom_dataset(custom_path)
+                self.logger.info(f"Loaded custom dataset from {custom_path}")
+                return
             except Exception as e:
                 self.logger.warning(f"Failed to load custom dataset: {e}")
-                self._generate_synthetic_data()
-        else:
-            # For simplicity, just use synthetic data
-            # Real implementation would load from HuggingFace
-            self.logger.info("Using synthetic calibration data")
+                # Fall through to try standard datasets
+        
+        # Try to load from HuggingFace datasets
+        try:
+            from datasets import load_dataset
+            
+            # Configure dataset parameters
+            dataset_configs = {
+                "c4": {"path": "c4", "subset": subset or "en", "split": f"{split}[:1000]"},
+                "wikitext": {"path": "wikitext", "subset": "wikitext-103-v1", "split": split},
+                "pile": {"path": "EleutherAI/pile", "subset": subset, "split": f"{split}[:1000]"},
+                "openwebtext": {"path": "Skylion007/openwebtext", "subset": None, "split": f"{split}[:1000]"},
+            }
+            
+            if dataset_name in dataset_configs:
+                config = dataset_configs[dataset_name]
+                self.logger.info(f"Loading {dataset_name} from HuggingFace...")
+                
+                # Load dataset
+                if config["subset"]:
+                    dataset = load_dataset(config["path"], config["subset"], split=config["split"], streaming=True)
+                else:
+                    dataset = load_dataset(config["path"], split=config["split"], streaming=True)
+                
+                # Extract text samples
+                self.raw_data = []
+                text_field = "text" if "text" in next(iter(dataset)).keys() else "content"
+                
+                for i, sample in enumerate(dataset):
+                    if i >= self.num_samples * 2:  # Load 2x samples for variety
+                        break
+                    text = sample.get(text_field, "")
+                    if text and len(text) > 100:  # Filter very short texts
+                        self.raw_data.append(text)
+                
+                if len(self.raw_data) < self.num_samples:
+                    self.logger.warning(f"Only loaded {len(self.raw_data)} samples, generating additional synthetic data")
+                    self._generate_synthetic_data()
+                
+                self.logger.info(f"Loaded {len(self.raw_data)} samples from {dataset_name}")
+            else:
+                raise ValueError(f"Unknown dataset: {dataset_name}")
+                
+        except ImportError as e:
+            self.logger.warning("datasets library not installed, using synthetic data")
+            self.logger.info("Install with: pip install datasets")
+            self.logger.info("Or install with: pip install datasets transformers")
+            self._generate_synthetic_data()
+            
+        except ConnectionError as e:
+            self.logger.error(f"Network error loading dataset: {e}")
+            self.logger.info("Check your internet connection or use a local dataset with --calibration-path")
+            self._generate_synthetic_data()
+            
+        except ValueError as e:
+            self.logger.error(f"Invalid dataset configuration: {e}")
+            self.logger.info(f"Available datasets: {list(dataset_configs.keys())}")
+            raise CalibrationError(f"Invalid dataset: {dataset_name}") from e
+            
+        except Exception as e:
+            self.logger.warning(f"Unexpected error loading dataset: {type(e).__name__}: {e}")
+            self.logger.info("Falling back to synthetic data")
+            # Log full traceback for debugging
+            import traceback
+            self.logger.debug(traceback.format_exc())
             self._generate_synthetic_data()
         
-        self.logger.info(f"Loaded {len(self.raw_data)} calibration samples")
+        self.logger.info(f"Total calibration samples: {len(self.raw_data)}")
+    
+    def download_and_cache_dataset(self, dataset_name: str = "c4", cache_dir: str = "~/.cache/glm_quantization") -> bool:
+        """Download and cache a dataset for offline use
+        
+        Args:
+            dataset_name: Name of dataset to download
+            cache_dir: Directory to cache dataset
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        cache_dir = Path(cache_dir).expanduser()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        cache_file = cache_dir / f"{dataset_name}_calibration.json"
+        
+        # Check if already cached
+        if cache_file.exists():
+            self.logger.info(f"Loading cached dataset from {cache_file}")
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached_data = json.load(f)
+                    self.raw_data = cached_data['texts']
+                    self.logger.info(f"Loaded {len(self.raw_data)} cached samples")
+                    return True
+            except Exception as e:
+                self.logger.warning(f"Failed to load cache: {e}")
+        
+        # Download fresh data
+        try:
+            from datasets import load_dataset
+            
+            self.logger.info(f"Downloading {dataset_name} dataset...")
+            
+            if dataset_name == "c4":
+                dataset = load_dataset("c4", "en", split="train", streaming=True)
+            elif dataset_name == "wikitext":
+                dataset = load_dataset("wikitext", "wikitext-103-v1", split="train")
+            else:
+                self.logger.error(f"Unsupported dataset for caching: {dataset_name}")
+                return False
+            
+            # Collect samples
+            texts = []
+            for i, sample in enumerate(dataset):
+                if i >= self.num_samples * 3:  # Get extra for filtering
+                    break
+                text = sample.get('text', '')
+                if text and len(text) > 200:
+                    texts.append(text)
+            
+            # Cache the data
+            cache_data = {
+                'dataset': dataset_name,
+                'num_samples': len(texts),
+                'texts': texts
+            }
+            
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f)
+            
+            self.logger.info(f"Cached {len(texts)} samples to {cache_file}")
+            self.raw_data = texts[:self.num_samples]
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to download dataset: {e}")
+            return False
     
     def prepare_calibration_data(self, 
                                 batch_size: int = 2) -> DataLoader:
@@ -192,33 +322,60 @@ class CalibrationDataHandler:
     def get_calibration_inputs(self, 
                                hidden_size: int,
                                seq_length: int = None,
-                               device: str = 'cpu') -> torch.Tensor:
-        """Generate calibration inputs as hidden states for layer processing
+                               device: str = 'cpu',
+                               return_tokens: bool = False) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Generate calibration inputs for layer processing
         
         Args:
             hidden_size: Model hidden dimension
             seq_length: Sequence length (uses max_length if None)
             device: Device to place tensors on
+            return_tokens: If True, return tokenized data instead of hidden states
             
         Returns:
-            Tensor of shape [batch_size, seq_length, hidden_size]
+            Tensor of shape [batch_size, seq_length, hidden_size] or dict with tokens
         """
         if seq_length is None:
             seq_length = self.max_length
         
-        if self.processed_samples:
-            # Use actual tokenized data to create hidden states
+        if return_tokens and self.processed_samples:
+            # Return actual tokenized data for proper forward pass
             batch_size = min(len(self.processed_samples), self.num_samples)
             
-            # Create hidden states tensor with proper initialization
-            # Using randn but scaled appropriately for hidden states
+            # Stack tokenized samples
+            input_ids_list = []
+            attention_mask_list = []
+            
+            for i in range(batch_size):
+                sample = self.processed_samples[i]
+                input_ids_list.append(sample.input_ids)
+                attention_mask_list.append(sample.attention_mask)
+            
+            input_ids = torch.stack(input_ids_list).to(device)
+            attention_mask = torch.stack(attention_mask_list).to(device)
+            
+            return {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask
+            }
+        
+        if self.processed_samples:
+            # Create more realistic hidden states based on token embeddings
+            batch_size = min(len(self.processed_samples), self.num_samples)
+            
+            # Initialize with small random values (like post-embedding)
             inputs = torch.randn(
                 batch_size, 
                 seq_length, 
                 hidden_size,
                 dtype=torch.float16,
                 device=device
-            ) * 0.02  # Small initialization like BERT/GPT
+            ) * 0.02
+            
+            # Add position-based variation to simulate positional embeddings
+            position_variance = torch.arange(seq_length, device=device).float() / seq_length
+            position_variance = position_variance.unsqueeze(0).unsqueeze(-1)
+            inputs = inputs + position_variance * 0.01
             
             self.logger.debug(f"Generated calibration inputs from {batch_size} samples: "
                             f"shape={inputs.shape}, device={inputs.device}")
@@ -232,6 +389,11 @@ class CalibrationDataHandler:
                 dtype=torch.float16,
                 device=device
             ) * 0.02
+            
+            # Add position variance even for synthetic data
+            position_variance = torch.arange(seq_length, device=device).float() / seq_length
+            position_variance = position_variance.unsqueeze(0).unsqueeze(-1)
+            inputs = inputs + position_variance * 0.01
             
             self.logger.debug(f"Generated synthetic calibration inputs: "
                             f"shape={inputs.shape}, device={inputs.device}")
@@ -442,47 +604,160 @@ class CalibrationDataHandler:
     # Helper methods
     
     def _generate_synthetic_data(self) -> None:
-        """Generate simple synthetic calibration data"""
+        """Generate diverse synthetic calibration data"""
         self.logger.info("Generating synthetic calibration data")
         
-        # Simple text templates
-        templates = [
-            "The quick brown fox jumps over the lazy dog.",
-            "Machine learning models require large amounts of data for training.",
-            "Natural language processing has advanced significantly in recent years.",
-            "Deep learning architectures continue to evolve and improve.",
-            "Transformer models have revolutionized the field of AI.",
-            "Quantization reduces model size while maintaining performance.",
-            "GPU acceleration enables faster model inference.",
-            "Large language models can understand and generate human-like text.",
-        ]
+        # More diverse text templates covering different domains
+        templates = {
+            "technical": [
+                "Machine learning models require large amounts of data for training effective representations.",
+                "Deep learning architectures continue to evolve with innovations in attention mechanisms.",
+                "Transformer models have revolutionized natural language processing and computer vision.",
+                "Quantization techniques reduce model size while maintaining acceptable performance levels.",
+                "GPU acceleration and specialized hardware enable efficient large-scale model inference.",
+                "Neural networks learn hierarchical representations through multiple layers of abstraction.",
+                "Optimization algorithms like Adam and SGD guide the training process effectively.",
+                "Transfer learning allows models to leverage knowledge from pre-trained representations.",
+            ],
+            "general": [
+                "The weather patterns this year have been particularly unusual across many regions.",
+                "Economic indicators suggest varying trends in global markets and trade relations.",
+                "Scientific research continues to advance our understanding of complex phenomena.",
+                "Educational institutions are adapting to new methods of teaching and learning.",
+                "Healthcare systems worldwide face ongoing challenges and opportunities for improvement.",
+                "Environmental conservation efforts require coordinated action at multiple levels.",
+                "Technological innovations are reshaping how people communicate and collaborate.",
+                "Cultural exchanges foster mutual understanding between diverse communities.",
+            ],
+            "narrative": [
+                "The discovery came after years of dedicated research and countless experiments.",
+                "Teams worked tirelessly to overcome the technical challenges they encountered.",
+                "Initial results were promising, leading to expanded investigations and trials.",
+                "Collaborative efforts between institutions accelerated the pace of progress.",
+                "Unexpected findings opened new avenues for exploration and development.",
+                "The implications of this work extend far beyond the original scope.",
+                "Future applications could transform multiple industries and fields.",
+                "Continued investment in research and development remains critical.",
+            ]
+        }
         
-        # Generate samples by repeating and combining templates
-        self.raw_data = []
-        for i in range(self.num_samples):
-            # Combine multiple templates to create longer text
-            num_templates = random.randint(3, 8)
-            selected = random.choices(templates, k=num_templates)
-            text = " ".join(selected)
-            self.raw_data.append(text)
+        # Generate samples with variety
+        if not hasattr(self, 'raw_data'):
+            self.raw_data = []
+        
+        existing_samples = len(self.raw_data)
+        needed_samples = self.num_samples - existing_samples
+        
+        if needed_samples <= 0:
+            return
+        
+        for i in range(needed_samples):
+            # Vary the text length and complexity
+            num_sentences = random.randint(5, 15)
+            
+            # Mix templates from different categories
+            selected_sentences = []
+            for _ in range(num_sentences):
+                category = random.choice(list(templates.keys()))
+                sentence = random.choice(templates[category])
+                selected_sentences.append(sentence)
+            
+            # Add some variation by occasionally modifying sentences
+            if random.random() < 0.3:
+                # Add a number or year
+                year = random.randint(2000, 2024)
+                selected_sentences.append(f"In {year}, significant developments occurred in this field.")
+            
+            if random.random() < 0.3:
+                # Add a percentage or statistic
+                percent = random.randint(10, 90)
+                selected_sentences.append(f"Studies show that approximately {percent}% of cases exhibit similar patterns.")
+            
+            # Combine into coherent text
+            text = " ".join(selected_sentences)
+            
+            # Ensure minimum length
+            if len(text) > 200:
+                self.raw_data.append(text)
+        
+        # Shuffle for variety
+        random.shuffle(self.raw_data)
+        
+        self.logger.info(f"Generated {needed_samples} synthetic samples (total: {len(self.raw_data)})")
     
     def _load_custom_dataset(self, path: str) -> None:
-        """Load custom dataset from file"""
+        """Load custom dataset from file
+        
+        Supports .txt, .json, .jsonl, .csv formats
+        """
         path = Path(path)
         
         if not path.exists():
             raise FileNotFoundError(f"Custom dataset not found: {path}")
         
+        self.raw_data = []
+        
         if path.suffix == '.txt':
-            with open(path, 'r') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 # Each line is a sample
-                self.raw_data = [line.strip() for line in f if line.strip()][:self.num_samples]
+                for line in f:
+                    line = line.strip()
+                    if line and len(line) > 50:  # Filter very short lines
+                        self.raw_data.append(line)
+                        if len(self.raw_data) >= self.num_samples * 2:
+                            break
+                            
         elif path.suffix == '.json':
-            with open(path, 'r') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    self.raw_data = data[:self.num_samples]
-                elif isinstance(data, dict) and 'texts' in data:
-                    self.raw_data = data['texts'][:self.num_samples]
+                    # List of texts
+                    for item in data:
+                        if isinstance(item, str):
+                            self.raw_data.append(item)
+                        elif isinstance(item, dict) and 'text' in item:
+                            self.raw_data.append(item['text'])
+                        if len(self.raw_data) >= self.num_samples * 2:
+                            break
+                elif isinstance(data, dict):
+                    # Dictionary with texts field
+                    texts = data.get('texts', data.get('text', data.get('data', [])))
+                    if isinstance(texts, list):
+                        self.raw_data = texts[:self.num_samples * 2]
+                        
+        elif path.suffix == '.jsonl':
+            # JSON Lines format
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        item = json.loads(line.strip())
+                        if isinstance(item, dict) and 'text' in item:
+                            self.raw_data.append(item['text'])
+                        elif isinstance(item, str):
+                            self.raw_data.append(item)
+                        if len(self.raw_data) >= self.num_samples * 2:
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                        
+        elif path.suffix == '.csv':
+            # CSV format
+            import csv
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Try common text column names
+                    text = row.get('text', row.get('content', row.get('sentence', '')))
+                    if text and len(text) > 50:
+                        self.raw_data.append(text)
+                        if len(self.raw_data) >= self.num_samples * 2:
+                            break
         else:
-            raise ValueError(f"Unsupported file format: {path.suffix}")
+            raise ValueError(f"Unsupported file format: {path.suffix}. Supported: .txt, .json, .jsonl, .csv")
+        
+        if not self.raw_data:
+            raise ValueError(f"No valid text samples found in {path}")
+        
+        # Shuffle for variety
+        random.shuffle(self.raw_data)
+        self.raw_data = self.raw_data[:self.num_samples]

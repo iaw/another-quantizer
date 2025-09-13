@@ -105,6 +105,12 @@ class CheckpointManager:
             state = CheckpointState.from_json(json_str)
             self.current_state = state
             
+            # Verify checkpoint integrity
+            if not self._verify_checkpoint_integrity(state):
+                self.logger.warning("Checkpoint integrity check failed")
+                # Try to recover what we can
+                state = self._recover_partial_checkpoint(state)
+            
             self.logger.info(f"Loaded checkpoint: layer {state.layer_idx}, "
                            f"{len(state.completed_layers)} layers completed")
             
@@ -113,6 +119,40 @@ class CheckpointManager:
         except Exception as e:
             self.logger.error(f"Failed to load checkpoint: {e}")
             return None
+    
+    def _verify_checkpoint_integrity(self, state: CheckpointState) -> bool:
+        """Verify that checkpoint state matches saved weights"""
+        weights_dir = self.checkpoint_dir / "quantized_weights"
+        if not weights_dir.exists():
+            return False
+        
+        # Check that all completed layers have weight files
+        for layer_name in state.completed_layers:
+            weight_file = weights_dir / f"{layer_name.replace('/', '_')}.safetensors"
+            if not weight_file.exists():
+                self.logger.warning(f"Missing weight file for completed layer: {layer_name}")
+                return False
+        
+        return True
+    
+    def _recover_partial_checkpoint(self, state: CheckpointState) -> CheckpointState:
+        """Recover what we can from a partial checkpoint"""
+        weights_dir = self.checkpoint_dir / "quantized_weights"
+        
+        # Find which layers actually have saved weights
+        actual_completed = []
+        for layer_name in state.completed_layers:
+            weight_file = weights_dir / f"{layer_name.replace('/', '_')}.safetensors"
+            if weight_file.exists():
+                actual_completed.append(layer_name)
+            else:
+                self.logger.info(f"Removing {layer_name} from completed list (no weights found)")
+        
+        # Update state
+        state.completed_layers = actual_completed
+        state.layer_idx = len(actual_completed) - 1 if actual_completed else -1
+        
+        return state
     
     def get_resume_point(self) -> Optional[Tuple[int, List[str]]]:
         """Get layer index and completed layers to resume from"""
@@ -130,10 +170,86 @@ class CheckpointManager:
         
         return (resume_idx, completed_layers)
     
+    def restore_quantized_state(self, model_loader: Any, layer_quantizer: Any) -> Dict[str, Any]:
+        """Restore quantized model state from checkpoint
+        
+        Args:
+            model_loader: Model loader instance
+            layer_quantizer: Layer quantizer instance
+            
+        Returns:
+            Dictionary with restored state information
+        """
+        if not self.current_state:
+            state = self.load_checkpoint()
+            if not state:
+                return {'success': False, 'error': 'No checkpoint found'}
+        else:
+            state = self.current_state
+        
+        restored_info = {
+            'success': True,
+            'completed_layers': state.completed_layers,
+            'layer_idx': state.layer_idx,
+            'restored_weights': {},
+            'restored_scales': {},
+        }
+        
+        weights_dir = self.checkpoint_dir / "quantized_weights"
+        scales_dir = self.checkpoint_dir / "scales"
+        
+        # Restore quantized weights
+        for layer_name in state.completed_layers:
+            weight_file = weights_dir / f"{layer_name.replace('/', '_')}.safetensors"
+            
+            if weight_file.exists():
+                try:
+                    # Load quantized weights
+                    weights = safetensors.torch.load_file(str(weight_file))
+                    restored_info['restored_weights'][layer_name] = weights
+                    
+                    # Load metadata
+                    with safetensors.safe_open(str(weight_file), framework="pt") as f:
+                        metadata = f.metadata() if hasattr(f, 'metadata') else {}
+                    
+                    self.logger.info(f"Restored weights for {layer_name} "
+                                   f"(bits={metadata.get('bits', '?')}, "
+                                   f"group_size={metadata.get('group_size', '?')})")
+                    
+                except Exception as e:
+                    self.logger.error(f"Failed to restore weights for {layer_name}: {e}")
+                    restored_info['success'] = False
+        
+        # Restore AWQ scales if available
+        scales_file = scales_dir / "awq_scales.pt"
+        if scales_file.exists():
+            try:
+                scales_data = torch.load(scales_file, map_location='cpu')
+                if hasattr(layer_quantizer, 'awq_scales'):
+                    layer_quantizer.awq_scales = scales_data
+                    restored_info['restored_scales'] = scales_data
+                    self.logger.info(f"Restored AWQ scales for {len(scales_data)} layers")
+            except Exception as e:
+                self.logger.warning(f"Failed to restore AWQ scales: {e}")
+        
+        # Restore activation cache if available
+        cache_file = self.checkpoint_dir / "activation_cache.pt"
+        if cache_file.exists():
+            try:
+                cache_data = torch.load(cache_file, map_location='cpu')
+                if hasattr(layer_quantizer, 'activation_cache'):
+                    layer_quantizer.activation_cache = cache_data
+                    self.logger.info(f"Restored activation cache with {len(cache_data)} entries")
+            except Exception as e:
+                self.logger.warning(f"Failed to restore activation cache: {e}")
+        
+        return restored_info
+    
     def save_quantized_weights(self,
                               layer_name: str,
-                              weights: Dict[str, torch.Tensor]) -> None:
-        """Save quantized weights for a layer"""
+                              weights: Dict[str, torch.Tensor],
+                              quantization_metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Save quantized weights for a layer with metadata"""
         # Create directory for weights
         weights_dir = self.checkpoint_dir / "quantized_weights"
         weights_dir.mkdir(exist_ok=True)
@@ -141,11 +257,106 @@ class CheckpointManager:
         # Save weights to safetensors file
         output_file = weights_dir / f"{layer_name.replace('/', '_')}.safetensors"
         
+        # Prepare metadata
+        metadata = {
+            'layer_name': layer_name,
+            'timestamp': datetime.now().isoformat(),
+            'checkpoint_version': '1.0',
+        }
+        
+        if quantization_metadata:
+            metadata.update({
+                'quantization_method': quantization_metadata.get('method', 'awq'),
+                'bits': str(quantization_metadata.get('bits', 4)),
+                'group_size': str(quantization_metadata.get('group_size', 128)),
+                'compression_ratio': str(quantization_metadata.get('compression_ratio', 1.0)),
+                'error': str(quantization_metadata.get('error', 0.0)),
+            })
+        
         try:
-            safetensors.torch.save_file(weights, output_file)
+            # Save with metadata
+            safetensors.torch.save_file(weights, output_file, metadata=metadata)
             self.logger.debug(f"Saved weights for {layer_name} to {output_file}")
+            
+            # Update manifest
+            self._update_manifest(layer_name, output_file, metadata)
+            
         except Exception as e:
             self.logger.error(f"Failed to save weights for {layer_name}: {e}")
+    
+    def _update_manifest(self, layer_name: str, weight_file: Path, metadata: Dict[str, Any]) -> None:
+        """Update manifest file with layer information"""
+        manifest_file = self.checkpoint_dir / "manifest.json"
+        
+        if manifest_file.exists():
+            with open(manifest_file, 'r') as f:
+                manifest = json.load(f)
+        else:
+            manifest = {
+                'created': datetime.now().isoformat(),
+                'layers': {}
+            }
+        
+        manifest['layers'][layer_name] = {
+            'file': weight_file.name,
+            'timestamp': metadata.get('timestamp'),
+            'quantization': {
+                'method': metadata.get('quantization_method'),
+                'bits': metadata.get('bits'),
+                'group_size': metadata.get('group_size'),
+            }
+        }
+        
+        manifest['last_updated'] = datetime.now().isoformat()
+        
+        with open(manifest_file, 'w') as f:
+            json.dump(manifest, f, indent=2)
+    
+    def save_intermediate_state(self, layer_quantizer: Any) -> None:
+        """Save intermediate quantization state (scales, caches, etc.)
+        
+        Args:
+            layer_quantizer: Layer quantizer instance with state to save
+        """
+        # Save AWQ scales
+        if hasattr(layer_quantizer, 'awq_scales') and layer_quantizer.awq_scales:
+            scales_dir = self.checkpoint_dir / "scales"
+            scales_dir.mkdir(exist_ok=True)
+            scales_file = scales_dir / "awq_scales.pt"
+            
+            try:
+                torch.save(layer_quantizer.awq_scales, scales_file)
+                self.logger.debug(f"Saved AWQ scales for {len(layer_quantizer.awq_scales)} layers")
+            except Exception as e:
+                self.logger.warning(f"Failed to save AWQ scales: {e}")
+        
+        # Save activation cache (limit size to prevent huge files)
+        if hasattr(layer_quantizer, 'activation_cache') and layer_quantizer.activation_cache:
+            # Only save last 5 layers of activations
+            cache_to_save = dict(list(layer_quantizer.activation_cache.items())[-5:])
+            
+            if cache_to_save:
+                cache_file = self.checkpoint_dir / "activation_cache.pt"
+                try:
+                    torch.save(cache_to_save, cache_file)
+                    self.logger.debug(f"Saved activation cache for {len(cache_to_save)} layers")
+                except Exception as e:
+                    self.logger.warning(f"Failed to save activation cache: {e}")
+        
+        # Save scale propagator state if available
+        if hasattr(layer_quantizer, 'scale_propagator'):
+            propagator_file = self.checkpoint_dir / "scale_propagator_state.json"
+            try:
+                propagator_state = {
+                    'layer_connections': layer_quantizer.scale_propagator.layer_connections,
+                    'scale_factors': {k: v.tolist() if torch.is_tensor(v) else v 
+                                    for k, v in layer_quantizer.scale_propagator.scale_factors.items()}
+                }
+                with open(propagator_file, 'w') as f:
+                    json.dump(propagator_state, f, indent=2)
+                self.logger.debug("Saved scale propagator state")
+            except Exception as e:
+                self.logger.warning(f"Failed to save scale propagator state: {e}")
     
     def cleanup(self) -> None:
         """Simple cleanup - remove old checkpoint files"""

@@ -32,6 +32,73 @@ class MemoryStats:
         return self.cpu_available
 
 
+@dataclass
+class SlidingWindowManager:
+    """Manage sliding window for activation collection to limit memory usage"""
+    window_size: int = 3  # Number of layers to keep in memory
+    current_layers: deque = field(default_factory=lambda: deque(maxlen=3))
+    activation_cache: Dict[str, torch.Tensor] = field(default_factory=dict)
+    weight_cache: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
+    cache_size_gb: float = 0.0
+    max_cache_gb: float = 4.0  # Maximum cache size in GB
+    
+    def add_layer(self, layer_name: str, activations: Optional[torch.Tensor] = None, 
+                  weights: Optional[Dict[str, torch.Tensor]] = None) -> None:
+        """Add layer to sliding window, evicting old layers if needed"""
+        # Check if we need to evict
+        if len(self.current_layers) >= self.window_size:
+            evicted = self.current_layers[0]  # Will be auto-removed by deque
+            # Clean up evicted layer's data
+            if evicted in self.activation_cache:
+                del self.activation_cache[evicted]
+            if evicted in self.weight_cache:
+                del self.weight_cache[evicted]
+        
+        # Add new layer
+        self.current_layers.append(layer_name)
+        
+        if activations is not None:
+            self.activation_cache[layer_name] = activations
+        if weights is not None:
+            self.weight_cache[layer_name] = weights
+        
+        # Update cache size
+        self._update_cache_size()
+    
+    def _update_cache_size(self) -> None:
+        """Calculate current cache size"""
+        total_size = 0
+        
+        # Activation cache size
+        for tensor in self.activation_cache.values():
+            if tensor is not None:
+                total_size += tensor.numel() * tensor.element_size()
+        
+        # Weight cache size
+        for layer_weights in self.weight_cache.values():
+            for tensor in layer_weights.values():
+                if tensor is not None:
+                    total_size += tensor.numel() * tensor.element_size()
+        
+        self.cache_size_gb = total_size / 1e9
+    
+    def should_offload(self) -> bool:
+        """Check if cache is too large and needs offloading"""
+        return self.cache_size_gb > self.max_cache_gb
+    
+    def get_activation(self, layer_name: str) -> Optional[torch.Tensor]:
+        """Get activation for layer if in cache"""
+        return self.activation_cache.get(layer_name)
+    
+    def clear_old_activations(self, keep_last_n: int = 1) -> None:
+        """Clear old activations keeping only last n"""
+        if len(self.activation_cache) > keep_last_n:
+            layers_to_remove = list(self.activation_cache.keys())[:-keep_last_n]
+            for layer in layers_to_remove:
+                del self.activation_cache[layer]
+        self._update_cache_size()
+
+
 @dataclass 
 class TensorTracker:
     """Track tensor allocations for memory management"""
@@ -56,6 +123,12 @@ class MemoryManager:
         self.gpu_device = torch.device("cuda:0") if torch.cuda.is_available() else None
         self.enable_aggressive_cleanup = True
         self.min_free_memory = 2.0  # Always keep 2GB free
+        
+        # Initialize sliding window for activation management
+        self.sliding_window = SlidingWindowManager(
+            window_size=3,
+            max_cache_gb=min(4.0, self.max_gpu_memory * 0.2)  # Use 20% of GPU memory for cache
+        )
         
         # Initialize CUDA if available
         if torch.cuda.is_available():
@@ -200,6 +273,65 @@ class MemoryManager:
         
         return gpu_tensor
     
+    def allocate_memory_for_layer(self, layer_size_gb: float, 
+                                 layer_type: str = "transformer") -> Dict[str, Any]:
+        """Adaptively allocate memory for layer based on size and type
+        
+        Args:
+            layer_size_gb: Estimated layer size
+            layer_type: Type of layer (transformer, moe, embedding, etc.)
+            
+        Returns:
+            Allocation strategy dictionary
+        """
+        current_stats = self.get_current_memory()
+        
+        strategy = {
+            'device': 'cuda:0',
+            'offload_activations': False,
+            'offload_weights': False,
+            'use_checkpointing': False,
+            'batch_size': self.max_gpu_memory // 4,  # Default
+        }
+        
+        # Adjust based on layer type
+        if layer_type == "moe":
+            # MoE layers need more memory for expert routing
+            required_memory = layer_size_gb * 2.5
+        elif layer_type == "embedding":
+            # Embeddings are large but accessed infrequently
+            required_memory = layer_size_gb * 1.2
+            strategy['offload_weights'] = True  # Can offload after initial use
+        else:
+            # Standard transformer layer
+            required_memory = layer_size_gb * 2.0
+        
+        # Check GPU availability
+        gpu_available = current_stats.gpu_free() - self.min_free_memory
+        
+        if required_memory > gpu_available:
+            # Need to use offloading strategy
+            if required_memory > gpu_available * 2:
+                # Extreme case: use CPU with gradient checkpointing
+                strategy['device'] = 'cpu'
+                strategy['use_checkpointing'] = True
+                strategy['batch_size'] = 1
+                self.logger.warning(f"Layer {layer_type} requires {required_memory:.2f}GB, "
+                                  f"using CPU with checkpointing")
+            else:
+                # Moderate case: offload activations after use
+                strategy['offload_activations'] = True
+                strategy['batch_size'] = max(1, int(gpu_available / layer_size_gb))
+                self.logger.info(f"Layer {layer_type} requires {required_memory:.2f}GB, "
+                               f"will offload activations")
+        
+        # Check if sliding window needs adjustment
+        if self.sliding_window.should_offload():
+            self.sliding_window.clear_old_activations(keep_last_n=1)
+            self.clear_gpu_cache()
+        
+        return strategy
+    
     def can_fit_on_gpu(self, size_gb: float, safety_margin: float = 0.1) -> bool:
         """Check if tensor of given size can fit on GPU"""
         if not torch.cuda.is_available():
@@ -286,26 +418,55 @@ class MemoryManager:
         elif cpu_usage_percent > 80:
             self.logger.warning(f"CPU memory usage high: {cpu_usage_percent:.1f}%")
     
-    def emergency_cleanup(self) -> None:
-        """Emergency memory cleanup if OOM is imminent"""
-        self.logger.warning("Performing emergency memory cleanup")
+    def emergency_cleanup(self, required_memory_gb: float = 0) -> bool:
+        """Emergency memory cleanup if OOM is imminent
         
-        # Force synchronize CUDA
+        Args:
+            required_memory_gb: Memory needed to free up
+            
+        Returns:
+            True if enough memory was freed
+        """
+        self.logger.warning(f"Performing emergency memory cleanup (need {required_memory_gb:.2f}GB)")
+        
+        initial_stats = self.get_current_memory()
+        
+        # Step 1: Clear sliding window cache
+        if self.sliding_window.cache_size_gb > 0:
+            self.sliding_window.clear_old_activations(keep_last_n=0)
+            self.logger.info(f"Cleared sliding window cache: {self.sliding_window.cache_size_gb:.2f}GB")
+        
+        # Step 2: Force synchronize and clear CUDA
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         
-        # Clear all caches
-        self.clear_gpu_cache()
+        # Step 3: Clear tracked tensors that are on GPU
+        gpu_tensors_to_clear = []
+        for name, tracker in self.tensor_registry.items():
+            if 'cuda' in tracker.device and tracker.size_gb > 0.1:  # Clear tensors > 100MB
+                gpu_tensors_to_clear.append(name)
         
-        # Single aggressive GC pass
-        gc.collect()
+        for name in gpu_tensors_to_clear:
+            self.unregister_tensor(name)
+            self.logger.debug(f"Unregistered tensor: {name}")
         
-        # Clear Python's internal caches
+        # Step 4: Aggressive garbage collection
+        for _ in range(3):
+            gc.collect()
+        
+        # Step 5: Final CUDA cleanup
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        # Log final state
+        # Check if we freed enough memory
+        final_stats = self.get_current_memory()
+        freed_memory = initial_stats.gpu_used - final_stats.gpu_used
+        
+        self.logger.info(f"Emergency cleanup freed {freed_memory:.2f}GB GPU memory")
         self.monitor_memory("after_emergency_cleanup")
+        
+        return freed_memory >= required_memory_gb
     
     def estimate_tensor_size(self, tensor: torch.Tensor) -> float:
         """Estimate tensor size in GB"""
@@ -397,6 +558,69 @@ class MemoryManager:
                 "max_cpu_gb": self.max_cpu_memory,
             }
         }
+    
+    def schedule_layer_processing(self, layer_sizes: List[Tuple[str, float]]) -> List[Dict[str, Any]]:
+        """Schedule layer processing to optimize memory usage
+        
+        Args:
+            layer_sizes: List of (layer_name, size_gb) tuples
+            
+        Returns:
+            List of processing strategies for each layer
+        """
+        schedule = []
+        
+        # Sort layers by size to process smaller ones first when possible
+        # But maintain some order for layer dependencies
+        grouped_layers = []
+        current_group = []
+        current_group_size = 0
+        max_group_size = self.max_gpu_memory * 0.7  # Use 70% of GPU memory per group
+        
+        for layer_name, size_gb in layer_sizes:
+            if current_group_size + size_gb > max_group_size and current_group:
+                # Start new group
+                grouped_layers.append(current_group)
+                current_group = [(layer_name, size_gb)]
+                current_group_size = size_gb
+            else:
+                current_group.append((layer_name, size_gb))
+                current_group_size += size_gb
+        
+        if current_group:
+            grouped_layers.append(current_group)
+        
+        # Create schedule for each group
+        for group_idx, group in enumerate(grouped_layers):
+            group_size = sum(size for _, size in group)
+            
+            # Determine strategy for this group
+            if group_size < self.max_gpu_memory * 0.5:
+                # Can process entirely on GPU
+                strategy = 'gpu_batch'
+                device = 'cuda:0'
+            elif group_size < self.max_gpu_memory:
+                # Process on GPU with memory management
+                strategy = 'gpu_sequential'
+                device = 'cuda:0'
+            else:
+                # Need CPU offloading
+                strategy = 'cpu_offload'
+                device = 'mixed'
+            
+            for layer_name, size_gb in group:
+                schedule.append({
+                    'layer_name': layer_name,
+                    'size_gb': size_gb,
+                    'group_idx': group_idx,
+                    'strategy': strategy,
+                    'device': device,
+                    'clear_cache_after': True if strategy == 'cpu_offload' else False,
+                })
+        
+        self.logger.info(f"Created processing schedule for {len(layer_sizes)} layers in {len(grouped_layers)} groups")
+        
+        return schedule
     
     def optimize_memory_layout(self, required_size: float) -> bool:
         """Try to optimize memory to fit required size"""

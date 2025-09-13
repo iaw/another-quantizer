@@ -464,7 +464,7 @@ def quantize_command(args: argparse.Namespace) -> int:
     logging.info(f"Saved configuration to: {config_file_path}")
     
     # Initialize pipeline
-    from pipeline import GLMQuantizationPipeline
+    from quantization_pipeline import GLMQuantizationPipeline
     
     # Create temporary config file for pipeline
     import tempfile
@@ -479,15 +479,53 @@ def quantize_command(args: argparse.Namespace) -> int:
         # Determine if we should resume
         should_resume = args.resume or args.resume_from is not None
         
-        # Run quantization
-        pipeline.run(resume_from_checkpoint=args.resume_from if should_resume else None)
-        
-        logging.info("Quantization completed successfully")
-        return 0
+        # Run quantization with error recovery
+        try:
+            pipeline.run(resume_from_checkpoint=resume_checkpoint)
+            logging.info("Quantization completed successfully")
+            return 0
+            
+        except MemoryError as e:
+            logging.error(f"Memory error during quantization: {e}")
+            logging.info("Try reducing --batch-size or --calibration-samples")
+            logging.info("Or enable --offload-to-cpu if not already enabled")
+            return 2
+            
+        except CalibrationError as e:
+            logging.error(f"Calibration data error: {e}")
+            logging.info("Try using a different dataset or provide custom data with --calibration-path")
+            return 3
+            
+        except CheckpointError as e:
+            logging.error(f"Checkpoint error: {e}")
+            logging.info("Check disk space and permissions in checkpoint directory")
+            return 4
+            
+        except LayerQuantizationError as e:
+            logging.error(f"Layer quantization failed: {e}")
+            logging.info(f"Failed layer: {e.layer_name}")
+            logging.info("The partial model may be usable. Check the checkpoint directory.")
+            return 5
+            
+    except KeyboardInterrupt:
+        logging.info("Quantization interrupted by user")
+        if pipeline:
+            pipeline.save_checkpoint()
+            logging.info("Progress saved. Use --resume to continue.")
+        return 130
         
     except Exception as e:
-        logging.error(f"Quantization failed: {e}")
+        logging.error(f"Unexpected error: {type(e).__name__}: {e}")
         logging.debug(traceback.format_exc())
+        
+        # Try to save emergency checkpoint
+        if pipeline:
+            try:
+                pipeline.create_emergency_checkpoint("unexpected_error")
+                logging.info("Emergency checkpoint saved")
+            except:
+                pass
+        
         return 1
     finally:
         # Clean up temp file
@@ -507,36 +545,78 @@ def validate_command(args: argparse.Namespace) -> int:
     - Measure perplexity
     - Test generation
     """
-    # Load quantized model
-    model_path = args.model_path or args.output_path
+    # Get paths
+    quantized_path = args.model_path or args.output_path
+    original_path = getattr(args, 'original_model_path', None)
     
-    if not model_path:
+    if not quantized_path:
         logging.error("Model path required for validation")
         return 1
     
-    logging.info(f"Validating quantized model: {model_path}")
+    # If no original path specified, try to infer from quantized path
+    if not original_path:
+        # Look for original path in quantized model metadata
+        quantized_config = Path(quantized_path) / "config.json"
+        if quantized_config.exists():
+            with open(quantized_config, 'r') as f:
+                config = json.load(f)
+                original_path = config.get('_original_model_path')
+        
+        if not original_path:
+            logging.warning("Original model path not specified, validation will be limited")
+            # Run basic validation
+            metrics = validate_quantized_model(quantized_path)
+            print_validation_results(metrics)
+            
+            # Basic pass/fail
+            if metrics.get("perplexity", float('inf')) < 100:
+                logging.info("Basic validation PASSED ✓")
+                return 0
+            else:
+                logging.error("Basic validation FAILED ✗")
+                return 1
     
-    # Run validation
-    metrics = validate_quantized_model(model_path)
+    logging.info(f"Validating quantized model: {quantized_path}")
+    logging.info(f"Against original model: {original_path}")
+    
+    # Use full validator
+    from validation import ModelValidator
+    
+    validator = ModelValidator(original_path, quantized_path)
+    
+    # Run full validation
+    result = validator.validate_full_model(num_samples=args.validation_samples if hasattr(args, 'validation_samples') else 100)
+    
+    # Generate report
+    report_path = Path(quantized_path) / "validation_report.json"
+    validator.generate_validation_report(result, report_path)
     
     # Print results
-    print_validation_results(metrics)
+    print("\n" + "="*80)
+    print("VALIDATION RESULTS")
+    print("="*80)
+    print(f"Overall Score: {result.overall_score:.2%}")
+    print(f"Perplexity: {result.perplexity:.2f}")
+    print(f"Generation Quality: {result.generation_quality:.2%}")
+    print(f"Weight Statistics:")
+    for key, value in result.weight_statistics.items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.4f}")
+        else:
+            print(f"  {key}: {value}")
+    print(f"Validation: {'PASSED ✓' if result.passed else 'FAILED ✗'}")
+    print("="*80)
     
-    # Check if passes thresholds
-    if metrics.get("perplexity", float('inf')) < 20 and metrics.get("generation_ok", False):
-        logging.info("Validation PASSED ✓")
-        return 0
-    else:
-        logging.error("Validation FAILED ✗")
-        return 1
+    return 0 if result.passed else 1
 
 
 def export_command(args: argparse.Namespace) -> int:
     """Export quantized model for vLLM
     
     Export tasks:
-    - Convert format
-    - Create configs
+    - Convert format to vLLM requirements
+    - Create vLLM-specific configs
+    - Handle sharding for tensor parallel
     - Optimize for serving
     """
     input_path = args.model_path or args.checkpoint_dir
@@ -549,17 +629,55 @@ def export_command(args: argparse.Namespace) -> int:
     logging.info(f"Exporting model from {input_path} to {output_path}")
     
     try:
-        export_for_vllm(
-            quantized_path=input_path,
-            output_path=output_path,
-            num_gpus=args.num_gpus
-        )
+        # Use vLLM exporter
+        from vllm_export import VLLMExporter
         
-        logging.info(f"Export complete: {output_path}")
-        return 0
+        exporter = VLLMExporter(input_path, output_path)
+        
+        # Export with sharding if multiple GPUs
+        num_gpus = getattr(args, 'num_gpus', 1)
+        export_status = exporter.export(num_shards=num_gpus if num_gpus > 1 else None)
+        
+        if export_status['success']:
+            logging.info(f"Export successful: {output_path}")
+            
+            # Create serving config
+            serving_config = create_vllm_config(
+                output_path,
+                num_gpus=num_gpus,
+                max_length=getattr(args, 'max_length', 32768)
+            )
+            
+            # Save serving config
+            config_file = Path(output_path) / "vllm_serving_config.json"
+            with open(config_file, 'w') as f:
+                json.dump(serving_config, f, indent=2)
+            
+            logging.info(f"Created vLLM serving config: {config_file}")
+            
+            # Print usage instructions
+            print("\n" + "="*80)
+            print("vLLM Export Complete!")
+            print("="*80)
+            print(f"\nModel exported to: {output_path}")
+            print(f"\nTo serve with vLLM:")
+            print(f"  python -m vllm.entrypoints.openai.api_server \\")
+            print(f"    --model {output_path} \\")
+            print(f"    --quantization awq \\")
+            print(f"    --tensor-parallel-size {num_gpus}")
+            print("\nOr with the config file:")
+            print(f"  vllm serve --config {config_file}")
+            print("="*80 + "\n")
+            
+            return 0
+        else:
+            logging.error(f"Export failed: {export_status.get('errors', 'Unknown error')}")
+            return 1
         
     except Exception as e:
         logging.error(f"Export failed: {e}")
+        import traceback
+        logging.debug(traceback.format_exc())
         return 1
 
 
@@ -682,7 +800,7 @@ def quantize_glm(
         config = config_obj.to_dict()
     
     # Initialize pipeline - FIXED IMPORT
-    from pipeline import GLMQuantizationPipeline
+    from quantization_pipeline import GLMQuantizationPipeline
     
     # Create temp config file
     import tempfile
