@@ -384,12 +384,84 @@ class LayerQuantizer:
         start_time = time.time()
         self.logger.info(f"Starting quantization of layer: {layer_name}")
         
+        # PRE-QUANTIZATION DTYPE VALIDATION AND ENFORCEMENT
+        # Get authoritative dtype
+        if self.authoritative_dtype is not None:
+            expected_dtype = self.authoritative_dtype
+        elif self.model_loader is not None:
+            expected_dtype = self.model_loader.get_authoritative_dtype()
+        else:
+            # Fallback to first parameter's dtype
+            expected_dtype = next(layer.parameters()).dtype
+            self.logger.warning(f"No authoritative dtype available, using first parameter dtype: {expected_dtype}")
+        
+        self.logger.debug(f"[{layer_name}] Expected dtype for quantization: {expected_dtype}")
+        
+        # Check all parameters and force conversion if needed
+        dtype_mismatches = []
+        for name, param in list(layer.named_parameters()):  # Use list() to avoid modification during iteration
+            if param.dtype != expected_dtype:
+                dtype_mismatches.append((name, param.dtype))
+                self.logger.warning(f"[{layer_name}] Parameter {name} has dtype {param.dtype}, expected {expected_dtype}")
+                
+                # Create new Parameter with correct dtype
+                new_param = nn.Parameter(param.data.to(expected_dtype))
+                
+                # Find the parent module and parameter name to replace it
+                if '.' in name:
+                    # Navigate to the parent module
+                    parent_name, param_name = name.rsplit('.', 1)
+                    parent_module = layer
+                    for part in parent_name.split('.'):
+                        if part.isdigit():
+                            parent_module = parent_module[int(part)]
+                        elif '[' in part and ']' in part:
+                            # Handle dict access like attention['q_proj']
+                            module_name = part.split('[')[0]
+                            key = part.split("'")[1] if "'" in part else part.split('"')[1]
+                            parent_module = getattr(parent_module, module_name)[key]
+                        else:
+                            parent_module = getattr(parent_module, part)
+                    setattr(parent_module, param_name, new_param)
+                else:
+                    # Direct attribute of layer
+                    setattr(layer, name, new_param)
+        
+        # Also check and convert buffers
+        for name, buffer in layer.named_buffers():
+            if buffer.dtype.is_floating_point and buffer.dtype != expected_dtype:
+                dtype_mismatches.append((f"buffer:{name}", buffer.dtype))
+                self.logger.warning(f"[{layer_name}] Buffer {name} has dtype {buffer.dtype}, expected {expected_dtype}")
+                # Force conversion
+                buffer.data = buffer.data.to(expected_dtype)
+        
+        if dtype_mismatches:
+            self.logger.info(f"[{layer_name}] Forced {len(dtype_mismatches)} parameters/buffers to {expected_dtype}")
+            self.logger.debug(f"[{layer_name}] Converted: {dtype_mismatches}")
+        
+        # Final verification - all parameters should now have the same dtype
+        final_dtypes = set()
+        for param in layer.parameters():
+            final_dtypes.add(param.dtype)
+        
+        if len(final_dtypes) > 1:
+            self.logger.error(f"[{layer_name}] CRITICAL: Mixed dtypes after forced conversion: {final_dtypes}")
+            # Last resort - convert entire module
+            layer = layer.to(expected_dtype)
+            self.logger.info(f"[{layer_name}] Applied module-level conversion to {expected_dtype}")
+        elif len(final_dtypes) == 1:
+            actual_dtype = final_dtypes.pop()
+            if actual_dtype != expected_dtype:
+                self.logger.warning(f"[{layer_name}] All parameters have {actual_dtype}, but expected {expected_dtype}")
+            else:
+                self.logger.debug(f"[{layer_name}] All parameters confirmed to be {actual_dtype}")
+        
         # Handle None calibration data
         if calibration_data is None:
             self.logger.warning(f"[{layer_name}] Calibration data is None, generating synthetic data")
             hidden_size = self._get_hidden_size(layer)
             device = next(layer.parameters()).device
-            dtype = self.authoritative_dtype if self.authoritative_dtype else torch.float16
+            dtype = expected_dtype  # Use the expected dtype we just enforced
             calibration_data = torch.randn(1, 128, hidden_size, device=device, dtype=dtype) * 0.02
         
         # Type checking and logging for calibration data
@@ -486,11 +558,25 @@ class LayerQuantizer:
         
         # Move layer to GPU if needed and possible
         device = self._determine_device(layer, original_size_gb)
+        
+        # Before moving to device, ensure dtype consistency one more time
+        self.logger.debug(f"[{layer_name}] Moving to device {device} with dtype {expected_dtype}")
+        
         # Move to device AND ensure correct dtype
-        if self.authoritative_dtype is not None:
-            layer = layer.to(device=device, dtype=self.authoritative_dtype)
-        else:
-            layer = layer.to(device)
+        layer = layer.to(device=device, dtype=expected_dtype)
+        
+        # Verify the move was successful
+        actual_device = next(layer.parameters()).device
+        actual_dtype = next(layer.parameters()).dtype
+        
+        if str(actual_device) != device:
+            self.logger.warning(f"[{layer_name}] Device mismatch after move: expected {device}, got {actual_device}")
+        if actual_dtype != expected_dtype:
+            self.logger.error(f"[{layer_name}] Dtype mismatch after device move: expected {expected_dtype}, got {actual_dtype}")
+            # Force fix
+            for param in layer.parameters():
+                param.data = param.data.to(expected_dtype)
+            self.logger.info(f"[{layer_name}] Forced dtype correction after device move")
         # Force convert all Linear module weights directly
         if self.authoritative_dtype is not None:
             with torch.no_grad():

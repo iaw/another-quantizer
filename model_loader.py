@@ -718,7 +718,7 @@ class SequentialModelLoader:
         
         self.logger.debug(f"Created TransformerLayer {layer_idx} with dtype: {layer_dtype}")
         
-        # Load weights into the module (rest remains the same)
+        # Load weights into the module with universal dtype conversion
         for weight_name, weight_tensor in weights.items():
             # Validate tensor
             if weight_tensor is None:
@@ -733,72 +733,141 @@ class SequentialModelLoader:
             if f"layers.{layer_idx}." in weight_name:
                 component_name = weight_name.split(f"layers.{layer_idx}.")[-1]
                 
-                # Load attention weights - ensure consistent dtype
+                # ALWAYS convert to layer_dtype, no conditions
+                weight_tensor = weight_tensor.to(layer_dtype)
+                self.logger.debug(f"Converted {component_name} to {layer_dtype}")
+                
+                # Handle both direct component names and nested names (e.g., self_attn.q_proj.weight)
+                # Remove self_attn prefix if present
+                if component_name.startswith('self_attn.'):
+                    component_name = component_name[10:]  # Remove 'self_attn.'
+                elif component_name.startswith('mlp.'):
+                    component_name = component_name[4:]  # Remove 'mlp.'
+                
+                # Load attention weights
                 if 'input_layernorm' in component_name:
                     if 'weight' in component_name:
-                        # Convert to module's dtype if needed
-                        target_dtype = layer.input_layernorm.weight.dtype
-                        weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                        layer.input_layernorm.weight.data = weight_tensor
+                        layer.input_layernorm.weight = nn.Parameter(weight_tensor)
                     elif 'bias' in component_name:
                         if layer.input_layernorm.bias is not None:
-                            target_dtype = layer.input_layernorm.bias.dtype
-                            weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                            layer.input_layernorm.bias.data = weight_tensor
+                            layer.input_layernorm.bias = nn.Parameter(weight_tensor)
                 
                 elif 'q_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.attention['q_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.attention['q_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.attention['q_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features, 
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.attention['q_proj'] = new_linear
                 elif 'k_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.attention['k_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.attention['k_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.attention['k_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.attention['k_proj'] = new_linear
+                # Replace entire Linear module with correct dtype
+                    old_linear = layer.attention['k_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.attention['k_proj'] = new_linear
                 elif 'v_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.attention['v_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.attention['v_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.attention['v_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.attention['v_proj'] = new_linear
                 elif 'o_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.attention['o_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.attention['o_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.attention['o_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.attention['o_proj'] = new_linear
                 
                 # Load MLP weights
                 elif 'post_attention_layernorm' in component_name:
                     if 'weight' in component_name:
-                        target_dtype = layer.post_attention_layernorm.weight.dtype
-                        weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                        layer.post_attention_layernorm.weight.data = weight_tensor
+                        layer.post_attention_layernorm.weight = nn.Parameter(weight_tensor)
                     elif 'bias' in component_name:
                         if layer.post_attention_layernorm.bias is not None:
-                            target_dtype = layer.post_attention_layernorm.bias.dtype
-                            weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                            layer.post_attention_layernorm.bias.data = weight_tensor
+                            layer.post_attention_layernorm.bias = nn.Parameter(weight_tensor)
                 
                 elif 'gate_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.mlp['gate_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.mlp['gate_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.mlp['gate_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.mlp['gate_proj'] = new_linear
                 elif 'up_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.mlp['up_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.mlp['up_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.mlp['up_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.mlp['up_proj'] = new_linear
                 elif 'down_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.mlp['down_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.mlp['down_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.mlp['down_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.mlp['down_proj'] = new_linear
         
-        # Log final dtype state
+        # Force all parameters to layer_dtype before any validation
+        self.logger.debug(f"Enforcing dtype {layer_dtype} for all parameters in layer {layer_idx}")
+        conversion_count = 0
+        
+        # We need to replace Parameters properly, not just modify their data
+        for name, param in list(layer.named_parameters()):  # Use list() to avoid modification during iteration
+            if param.dtype != layer_dtype:
+                self.logger.debug(f"Converting parameter {name} from {param.dtype} to {layer_dtype}")
+                
+                # Create new Parameter with correct dtype
+                new_param = nn.Parameter(param.data.to(layer_dtype))
+                
+                # Find the parent module and parameter name to replace it
+                if '.' in name:
+                    # Navigate to the parent module
+                    parent_name, param_name = name.rsplit('.', 1)
+                    parent_module = layer
+                    for part in parent_name.split('.'):
+                        if part.isdigit():
+                            parent_module = parent_module[int(part)]
+                        else:
+                            parent_module = getattr(parent_module, part)
+                    setattr(parent_module, param_name, new_param)
+                else:
+                    # Direct attribute of layer
+                    setattr(layer, name, new_param)
+                
+                conversion_count += 1
+        
+        # Also enforce dtype for buffers
+        for name, buffer in layer.named_buffers():
+            if buffer.dtype.is_floating_point and buffer.dtype != layer_dtype:
+                self.logger.debug(f"Converting buffer {name} from {buffer.dtype} to {layer_dtype}")
+                buffer.data = buffer.data.to(layer_dtype)
+                conversion_count += 1
+        
+        if conversion_count > 0:
+            self.logger.info(f"Forced {conversion_count} parameters/buffers to {layer_dtype} in layer {layer_idx}")
+        
+        # Verify final dtype state
         param_dtypes = set()
         for param in layer.parameters():
             param_dtypes.add(param.dtype)
         
         if len(param_dtypes) > 1:
-            self.logger.warning(f"Layer {layer_idx} has mixed dtypes: {param_dtypes}")
+            self.logger.error(f"Layer {layer_idx} STILL has mixed dtypes after enforcement: {param_dtypes}")
+            # Force one more time with the whole module
+            layer = layer.to(dtype=layer_dtype)
         else:
             self.logger.debug(f"Constructed transformer layer {layer_idx} with uniform dtype: {param_dtypes.pop()}")
         
-        layer = layer.to(dtype=layer_dtype) 
         return layer
     
     def construct_moe_layer(self,
@@ -1018,7 +1087,7 @@ class SequentialModelLoader:
         
         self.logger.debug(f"Created MoELayer {layer_idx} with dtype: {layer_dtype}")
         
-        # Load weights into the module
+        # Load weights into the module with universal dtype conversion
         for weight_name, weight_tensor in weights.items():
             # Validate tensor
             if weight_tensor is None:
@@ -1033,45 +1102,69 @@ class SequentialModelLoader:
             if f"layers.{layer_idx}." in weight_name:
                 component_name = weight_name.split(f"layers.{layer_idx}.")[-1]
                 
-                # Load attention weights (same as transformer) - with dtype conversion
+                # ALWAYS convert to layer_dtype, no conditions
+                weight_tensor = weight_tensor.to(layer_dtype)
+                self.logger.debug(f"Converted {component_name} to {layer_dtype}")
+                
+                # Handle both direct component names and nested names (e.g., self_attn.q_proj.weight)
+                # Remove self_attn prefix if present
+                if component_name.startswith('self_attn.'):
+                    component_name = component_name[10:]  # Remove 'self_attn.'
+                elif component_name.startswith('mlp.'):
+                    component_name = component_name[4:]  # Remove 'mlp.'
+                
+                # Load attention weights
                 if 'input_layernorm' in component_name:
                     if 'weight' in component_name:
-                        target_dtype = layer.input_layernorm.weight.dtype
-                        weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                        layer.input_layernorm.weight.data = weight_tensor
+                        layer.input_layernorm.weight = nn.Parameter(weight_tensor)
                     elif 'bias' in component_name:
                         if hasattr(layer.input_layernorm, 'bias') and layer.input_layernorm.bias is not None:
-                            target_dtype = layer.input_layernorm.bias.dtype
-                            weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                            layer.input_layernorm.bias.data = weight_tensor
+                            layer.input_layernorm.bias = nn.Parameter(weight_tensor)
                 
                 elif 'q_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.attention['q_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.attention['q_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.attention['q_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.attention['q_proj'] = new_linear
                 elif 'k_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.attention['k_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.attention['k_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.attention['k_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.attention['k_proj'] = new_linear
                 elif 'v_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.attention['v_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.attention['v_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.attention['v_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.attention['v_proj'] = new_linear
                 elif 'o_proj' in component_name and 'weight' in component_name:
-                    target_dtype = layer.attention['o_proj'].weight.dtype
-                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                    layer.attention['o_proj'].weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.attention['o_proj']
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.attention['o_proj'] = new_linear
                 
                 # Load post attention layernorm
                 elif 'post_attention_layernorm' in component_name:
                     if 'weight' in component_name:
-                        layer.post_attention_layernorm.weight.data = weight_tensor
+                        layer.post_attention_layernorm.weight = nn.Parameter(weight_tensor)
                     elif 'bias' in component_name:
-                        layer.post_attention_layernorm.bias.data = weight_tensor
+                        layer.post_attention_layernorm.bias = nn.Parameter(weight_tensor)
                 
                 # Load router
                 elif 'router' in component_name and 'weight' in component_name:
-                    layer.router.weight.data = weight_tensor
+                    # Replace entire Linear module with correct dtype
+                    old_linear = layer.router
+                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                    new_linear.weight = nn.Parameter(weight_tensor)
+                    layer.router = new_linear
                 
                 # Load expert weights
                 elif 'expert' in component_name:
@@ -1080,44 +1173,92 @@ class SequentialModelLoader:
                     if expert_match:
                         expert_idx = int(expert_match.group(1))
                         
-                        # Determine if shared or regular expert
                         if 'shared' in component_name and hasattr(layer, 'shared_experts'):
                             if expert_idx < len(layer.shared_experts):
                                 expert = layer.shared_experts[expert_idx]
                                 if 'gate_proj' in component_name and 'weight' in component_name:
-                                    expert['gate_proj'].weight.data = weight_tensor
+                                    # Replace entire Linear module with correct dtype
+                                    old_linear = expert['gate_proj']
+                                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                                    new_linear.weight = nn.Parameter(weight_tensor)
+                                    expert['gate_proj'] = new_linear
                                 elif 'up_proj' in component_name and 'weight' in component_name:
-                                    expert['up_proj'].weight.data = weight_tensor
+                                    # Replace entire Linear module with correct dtype
+                                    old_linear = expert['up_proj']
+                                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                                    new_linear.weight = nn.Parameter(weight_tensor)
+                                    expert['up_proj'] = new_linear
                                 elif 'down_proj' in component_name and 'weight' in component_name:
-                                    expert['down_proj'].weight.data = weight_tensor
+                                    # Replace entire Linear module with correct dtype
+                                    old_linear = expert['down_proj']
+                                    new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                                         bias=(old_linear.bias is not None), dtype=layer_dtype)
+                                    new_linear.weight = nn.Parameter(weight_tensor)
+                                    expert['down_proj'] = new_linear
                         else:
                             # Regular expert
                             if expert_idx < len(layer.experts):
                                 expert = layer.experts[expert_idx]
                                 if 'gate_proj' in component_name and 'weight' in component_name:
-                                    target_dtype = expert['gate_proj'].weight.dtype
-                                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                                    expert['gate_proj'].weight.data = weight_tensor
+                                    expert['gate_proj'].weight = nn.Parameter(weight_tensor)
                                 elif 'up_proj' in component_name and 'weight' in component_name:
-                                    target_dtype = expert['up_proj'].weight.dtype
-                                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                                    expert['up_proj'].weight.data = weight_tensor
+                                    expert['up_proj'].weight = nn.Parameter(weight_tensor)
                                 elif 'down_proj' in component_name and 'weight' in component_name:
-                                    target_dtype = expert['down_proj'].weight.dtype
-                                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
-                                    expert['down_proj'].weight.data = weight_tensor
+                                    expert['down_proj'].weight = nn.Parameter(weight_tensor)
         
-        # Log final dtype state
+        # Force all parameters to layer_dtype before any validation
+        self.logger.debug(f"Enforcing dtype {layer_dtype} for all parameters in MoE layer {layer_idx}")
+        conversion_count = 0
+        
+        # We need to replace Parameters properly, not just modify their data
+        for name, param in list(layer.named_parameters()):  # Use list() to avoid modification during iteration
+            if param.dtype != layer_dtype:
+                self.logger.debug(f"Converting parameter {name} from {param.dtype} to {layer_dtype}")
+                
+                # Create new Parameter with correct dtype
+                new_param = nn.Parameter(param.data.to(layer_dtype))
+                
+                # Find the parent module and parameter name to replace it
+                if '.' in name:
+                    # Navigate to the parent module
+                    parent_name, param_name = name.rsplit('.', 1)
+                    parent_module = layer
+                    for part in parent_name.split('.'):
+                        if part.isdigit():
+                            parent_module = parent_module[int(part)]
+                        else:
+                            parent_module = getattr(parent_module, part)
+                    setattr(parent_module, param_name, new_param)
+                else:
+                    # Direct attribute of layer
+                    setattr(layer, name, new_param)
+                
+                conversion_count += 1
+        
+        # Also enforce dtype for buffers
+        for name, buffer in layer.named_buffers():
+            if buffer.dtype.is_floating_point and buffer.dtype != layer_dtype:
+                self.logger.debug(f"Converting buffer {name} from {buffer.dtype} to {layer_dtype}")
+                buffer.data = buffer.data.to(layer_dtype)
+                conversion_count += 1
+        
+        if conversion_count > 0:
+            self.logger.info(f"Forced {conversion_count} parameters/buffers to {layer_dtype} in MoE layer {layer_idx}")
+        
+        # Verify final dtype state
         param_dtypes = set()
         for param in layer.parameters():
             param_dtypes.add(param.dtype)
         
         if len(param_dtypes) > 1:
-            self.logger.warning(f"MoE layer {layer_idx} has mixed dtypes: {param_dtypes}")
+            self.logger.error(f"MoE layer {layer_idx} STILL has mixed dtypes after enforcement: {param_dtypes}")
+            # Force one more time with the whole module
+            layer = layer.to(dtype=layer_dtype)
         else:
             self.logger.debug(f"Constructed MoE layer {layer_idx} with {self.num_experts} experts, uniform dtype: {param_dtypes.pop()}")
         
-        layer = layer.to(dtype=layer_dtype) 
         return layer
     
     def save_quantized_layer(self, 
