@@ -24,17 +24,12 @@ try:
     # Check what's actually available in llmcompressor
     import llmcompressor
     
-    # Try to find AWQ in the quantization submodule
     try:
-        from llmcompressor.modifiers.quantization.awq import AWQModifier
+        from llmcompressor.modifiers.awq import AWQModifier
         LLM_COMPRESSOR_AVAILABLE = True
     except ImportError:
-        try:
-            from llmcompressor.quantization import AWQModifier
-            LLM_COMPRESSOR_AVAILABLE = True
-        except ImportError:
-            # AWQ might not be available in this version
-            pass
+        AWQModifier = None
+        LLM_COMPRESSOR_AVAILABLE = False
     
     # Try to import other components
     if LLM_COMPRESSOR_AVAILABLE:

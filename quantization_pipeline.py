@@ -387,7 +387,9 @@ class GLMQuantizationPipeline:
             
             # Move layer to appropriate device
             device = allocation_strategy['device']
-            layer_module = layer_module.to(device)
+            
+            current_dtype = next(layer_module.parameters()).dtype
+            layer_module = layer_module.to(device=device, dtype=current_dtype) 
             
             # Verify the layer actually moved to the intended device
             actual_device = next(layer_module.parameters()).device

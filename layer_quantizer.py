@@ -394,7 +394,6 @@ class LayerQuantizer:
             # Fallback to first parameter's dtype
             expected_dtype = next(layer.parameters()).dtype
             self.logger.warning(f"No authoritative dtype available, using first parameter dtype: {expected_dtype}")
-        
         self.logger.debug(f"[{layer_name}] Expected dtype for quantization: {expected_dtype}")
         
         # Check all parameters and force conversion if needed
@@ -562,6 +561,7 @@ class LayerQuantizer:
         # Before moving to device, ensure dtype consistency one more time
         self.logger.debug(f"[{layer_name}] Moving to device {device} with dtype {expected_dtype}")
         
+        
         # Move to device AND ensure correct dtype
         layer = layer.to(device=device, dtype=expected_dtype)
         
@@ -591,8 +591,6 @@ class LayerQuantizer:
                 module.weight.data = module.weight.data.to(self.authoritative_dtype)
                 if module.bias is not None:
                     module.bias.data = module.bias.data.to(self.authoritative_dtype)
-        
-        # Log the actual device the layer is on
         actual_device = next(layer.parameters()).device
         self.logger.debug(f"Layer {layer_name} moved to device: {device}, actual device: {actual_device}")
         
@@ -618,7 +616,7 @@ class LayerQuantizer:
             for key, value in calibration_data.items():
                 if torch.is_tensor(value):
                     # CRITICAL: Move to the actual device of the layer
-                    moved_tensor = value.to(layer_device)
+                    moved_tensor = value.to(device=layer_device, dtype=layer_dtype)  # Add dtype parameter!
                     
                     # Verify the tensor actually moved
                     if moved_tensor.device != layer_device:
@@ -670,8 +668,8 @@ class LayerQuantizer:
         
         try:
             # Identify layer type
+            self.logger.info('starting')
             layer_type = self._identify_layer_type(layer, layer_name)
-            
             # Compute AWQ scales with multiple samples if available
             # FIX: Properly check for DataLoader, not just any iterable (dicts are iterable too!)
             from torch.utils.data import DataLoader
@@ -1456,7 +1454,6 @@ class LayerQuantizer:
             # Increase scale for important channels to preserve their precision
             protection_factor = self.config.awq_protection_factor
             scale[salient_indices] *= protection_factor
-            
             # Apply additional scaling based on weight magnitude
             # Channels with very small weights need less aggressive quantization
             small_weight_mask = W_max < (W_max.mean() * 0.1)
@@ -1469,13 +1466,10 @@ class LayerQuantizer:
                 scale.device
             )
             one = self._create_scalar_tensor(1.0, scale.dtype, scale.device)
-            scale = scale * (one - damping) + one * damping
-            
-            # Clip to reasonable range using tensor bounds
+            scale = scale * (one - damping) + one * damping            # Clip to reasonable range using tensor bounds
             min_val = self._create_scalar_tensor(0.01, scale.dtype, scale.device)
             max_val = self._create_scalar_tensor(100.0, scale.dtype, scale.device)
             scale = torch.clamp(scale, min=min_val, max=max_val)
-            
             # Smooth the scales to avoid sudden changes
             if scale.shape[0] > 1:
                 # Simple moving average smoothing
@@ -1484,9 +1478,8 @@ class LayerQuantizer:
                     scale_padded = torch.nn.functional.pad(scale.unsqueeze(0).unsqueeze(0), 
                                                         (kernel_size//2, kernel_size//2), 
                                                         mode='replicate')
-                    kernel = torch.ones(1, 1, kernel_size, device=scale.device) / kernel_size
+                    kernel = torch.ones(1, 1, kernel_size, dtype=scale.dtype, device=scale.device) / kernel_size
                     scale = torch.nn.functional.conv1d(scale_padded, kernel).squeeze()
-            
             # Ensure scale is on the same device as the module weight
             if scale.device != module.weight.device:
                 self.logger.debug(f"Moving scale from {scale.device} to {module.weight.device}")

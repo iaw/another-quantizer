@@ -207,7 +207,7 @@ class MemoryManager:
                                 f"need {tensor_size:.2f}GB, have {current_stats.cpu_available:.2f}GB")
         
         # Move to CPU with pinned memory for faster transfers
-        cpu_tensor = tensor.to("cpu", non_blocking=True)
+        cpu_tensor = tensor.to(device="cpu", dtype=tensor.dtype, non_blocking=True)
         
         # Synchronize to ensure transfer completes
         if torch.cuda.is_available():
@@ -264,7 +264,7 @@ class MemoryManager:
         
         # Move to GPU
         device_str = f"cuda:{device}"
-        gpu_tensor = tensor.to(device_str, non_blocking=False)  # Blocking for safety
+        gpu_tensor = tensor.to(device=device_str, dtype=tensor.dtype, non_blocking=False)
         
         # Update tensor registry
         if name:
