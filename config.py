@@ -37,7 +37,7 @@ class QuantizationConfig:
     
     # Processing settings
     calibration_samples: int = 128
-    calibration_batch_size: int = 2
+    calibration_batch_size: int = 4
     checkpoint_every_n_layers: int = 5
     
     # Layer settings - GLM4.5 specific patterns
@@ -461,13 +461,13 @@ def create_default_config(model_path: str, output_path: str) -> QuantizationConf
         offload_to_cpu=offload_needed,
     )
     
-    # Adjust batch size based on model size
+    # Adjust batch size based on model size - ensure minimum for AWQ
     if model_config.num_layers > 50:  # Large model
-        config.calibration_batch_size = 1
+        config.calibration_batch_size = 2  # Minimum 2 for sufficient samples
     elif model_config.num_layers > 30:  # Medium model
-        config.calibration_batch_size = 2
+        config.calibration_batch_size = 4  # Better statistics with more samples
     else:  # Small model
-        config.calibration_batch_size = 4
+        config.calibration_batch_size = 8  # Can afford more samples
     
     return config
 

@@ -191,25 +191,31 @@ class GLMQuantizationPipeline:
             # 2048 is sufficient for calibration and won't cause OOM
             calibration_seq_length = min(2048, self.config.max_position_embeddings)
             self.logger.info(f"Using calibration sequence length: {calibration_seq_length} (max: {self.config.max_position_embeddings})")
+            
+            # Get authoritative dtype from model loader
+            model_dtype = self.model_loader.get_authoritative_dtype()
+            self.logger.info(f"Using authoritative model dtype: {model_dtype}")
+            
             self.calibration_handler = CalibrationDataHandler(
                 tokenizer=tokenizer,
                 max_length=calibration_seq_length,  # Use reasonable length for calibration
                 num_samples=self.config.calibration_samples,
-                hidden_size=hidden_size
+                hidden_size=hidden_size,
+                dtype=model_dtype  # Pass authoritative dtype
             )
             self.calibration_handler.load_calibration_dataset()
             
-            # Use model's detected dtype for calibration data
-            model_dtype = self.model_loader.model_dtype if self.model_loader.model_dtype else torch.float16
-            self.logger.info(f"Preparing calibration data with model dtype: {model_dtype}")
+            # Use authoritative dtype for calibration data
+            authoritative_dtype = self.model_loader.get_authoritative_dtype()
+            self.logger.info(f"Preparing calibration data with authoritative dtype: {authoritative_dtype}")
             
             # Ensure we use the correct dtype for calibration data
             # BFloat16 models should use BFloat16 calibration data
-            if model_dtype == torch.bfloat16:
+            if authoritative_dtype == torch.bfloat16:
                 self.logger.info("Model uses BFloat16, preparing calibration data in BFloat16")
             self.calibration_dataloader = self.calibration_handler.prepare_calibration_data(
                 batch_size=self.config.calibration_batch_size,
-                dtype=model_dtype  # Pass model dtype
+                dtype=authoritative_dtype  # Pass authoritative dtype
             )
             
             # Initialize Layer Quantizer with model_loader for dtype info
@@ -220,6 +226,13 @@ class GLMQuantizationPipeline:
                 memory_manager=self.memory_manager,
                 model_loader=self.model_loader  # Pass model loader for dtype detection
             )
+            
+            # Enable dtype validation in debug mode
+            if self.logger.level <= logging.DEBUG:
+                self.dtype_validation_enabled = True
+                self.logger.info("Dtype validation enabled for debugging")
+            else:
+                self.dtype_validation_enabled = False
             
             # Setup Checkpoint Manager
             self.logger.info("Setting up checkpoints...")
@@ -376,6 +389,13 @@ class GLMQuantizationPipeline:
             device = allocation_strategy['device']
             layer_module = layer_module.to(device)
             
+            # Verify the layer actually moved to the intended device
+            actual_device = next(layer_module.parameters()).device
+            if str(actual_device) != device:
+                self.logger.warning(f"Layer failed to move to {device}, actually on {actual_device}")
+                # Use the actual device for consistency
+                device = str(actual_device)
+            
             # Add to sliding window
             layer_weights = {}
             for name, module in layer_module.named_modules():
@@ -442,38 +462,42 @@ class GLMQuantizationPipeline:
             # Verify calibration_batch is not a string
             if isinstance(calibration_batch, str):
                     self.logger.error(f"CRITICAL: calibration_batch became a string: '{calibration_batch}'")
-                    # Recover by creating synthetic data with correct dtype
+                    # Recover by creating synthetic data with authoritative dtype
                     if hasattr(layer_module, 'hidden_size'):
                         hidden_size = layer_module.hidden_size
                     else:
                         hidden_size = 4096  # Default
                     
-                    # Get layer's expected dtype
-                    layer_dtype = next(layer_module.parameters()).dtype
-                    self.logger.info(f"Creating synthetic data with layer's dtype: {layer_dtype}")
+                    # Use authoritative dtype for recovery
+                    recovery_dtype = self.model_loader.get_authoritative_dtype()
+                    self.logger.info(f"Creating synthetic data with authoritative dtype: {recovery_dtype}")
                     
-                    calibration_batch = torch.randn(1, 128, hidden_size, device=device, dtype=layer_dtype) * 0.02
+                    calibration_batch = torch.randn(1, 128, hidden_size, device=device, dtype=recovery_dtype) * 0.02
             
-            # Get layer's expected dtype for consistency - with better logging
-            layer_dtype = self.model_loader.get_layer_dtype(layer_name) if self.model_loader else next(layer_module.parameters()).dtype
-            self.logger.debug(f"Processing {layer_name} with expected dtype: {layer_dtype}")
+            # Get layer's expected dtype - use authoritative source
+            layer_dtype = self.model_loader.get_authoritative_dtype()
+            self.logger.debug(f"Processing {layer_name} with authoritative dtype: {layer_dtype}")
             
             # Log dtype statistics periodically
             if self.state.current_layer_idx % 10 == 0:
                 self.logger.info(f"Dtype check - Layer {layer_name}: {layer_dtype}, "
-                               f"Model default: {self.model_loader.model_dtype if self.model_loader else 'unknown'}")
+                               f"Authoritative: {self.model_loader.get_authoritative_dtype()}")
             
             # Convert calibration batch dtype if needed (for float tensors)
             if torch.is_tensor(calibration_batch):
                 if calibration_batch.dtype.is_floating_point and calibration_batch.dtype != layer_dtype:
-                    self.logger.info(f"Converting calibration batch from {calibration_batch.dtype} to {layer_dtype}")
+                    self.logger.info(f"Converting calibration batch from {calibration_batch.dtype} to authoritative {layer_dtype}")
                     calibration_batch = calibration_batch.to(dtype=layer_dtype)
             elif isinstance(calibration_batch, dict):
                 # Convert float tensors in dict to correct dtype
+                calibration_batch_converted = {}
                 for key, value in calibration_batch.items():
                     if torch.is_tensor(value) and value.dtype.is_floating_point and value.dtype != layer_dtype:
-                        self.logger.info(f"Converting {key} from {value.dtype} to {layer_dtype}")
-                        calibration_batch[key] = value.to(dtype=layer_dtype)
+                        self.logger.info(f"Converting {key} from {value.dtype} to authoritative {layer_dtype}")
+                        calibration_batch_converted[key] = value.to(dtype=layer_dtype)
+                    else:
+                        calibration_batch_converted[key] = value
+                calibration_batch = calibration_batch_converted
             
             # Adjust batch size if needed
             if allocation_strategy['batch_size'] < self.config.calibration_batch_size:
@@ -736,6 +760,11 @@ class GLMQuantizationPipeline:
         self.logger.info(f"  Compression ratio: {model_metrics.overall_compression_ratio:.2f}x")
         self.logger.info(f"  Average MSE: {model_metrics.average_mse_error:.6f}")
         self.logger.info(f"  Average Cosine Similarity: {model_metrics.average_cosine_similarity:.4f}")
+        
+        # Add dtype consistency summary
+        self.logger.info(f"\nDtype Consistency:")
+        self.logger.info(f"  Authoritative dtype: {self.model_loader.get_authoritative_dtype()}")
+        self.logger.info(f"  Dtype validation: {'Enabled' if self.dtype_validation_enabled else 'Disabled'}")
     
     def _identify_layer_type(self, layer: nn.Module, layer_name: str) -> str:
         """Identify the type of layer for memory allocation

@@ -42,13 +42,17 @@ class SequentialModelLoader:
         self.logger = logging.getLogger(__name__)
         self.dtype = torch.float16  # Default dtype
         self.model_dtype = None  # Will be detected from weights
+        self.authoritative_dtype = None  # Single source of truth for dtype
         self.dtype_per_layer = {}  # Track dtype for each layer if mixed precision
         
         # Initialize by loading model configuration
         self.load_model_config()
         self.map_model_weights()
         self.build_layer_info()
-        self._detect_model_dtype()  # New method to detect actual dtype
+        self._detect_model_dtype()  # Detect and set authoritative dtype
+        
+        # Log the authoritative dtype for debugging
+        self.logger.info(f"Model initialized with authoritative dtype: {self.get_authoritative_dtype()}")
         
     def load_model_config(self) -> Dict[str, Any]:
         """Load only the model configuration"""
@@ -104,6 +108,9 @@ class SequentialModelLoader:
             self.model_dtype = self.dtype
             return
         
+        # Store as authoritative dtype for entire pipeline
+        self.authoritative_dtype = None  # Will be set after detection
+        
         dtype_counts = {}
         
         for weight_file in self.weight_files[:sample_size]:
@@ -145,10 +152,16 @@ class SequentialModelLoader:
                 self.logger.warning(f"Detected dtype {self.model_dtype} differs from config dtype {self.dtype}")
                 # Use detected dtype as it's more reliable
                 self.dtype = self.model_dtype
+            
+            # Set authoritative dtype for entire pipeline
+            self.authoritative_dtype = self.model_dtype
         else:
             # Fallback to config dtype
             self.model_dtype = self.dtype
+            self.authoritative_dtype = self.dtype
             self.logger.info(f"Using config dtype: {self.model_dtype}")
+        
+        self.logger.info(f"AUTHORITATIVE DTYPE SET: {self.authoritative_dtype}")
     
     def get_layer_dtype(self, layer_name: str) -> torch.dtype:
         """Get the expected dtype for a specific layer
@@ -165,6 +178,19 @@ class SequentialModelLoader:
         
         # Otherwise use model-wide dtype
         return self.model_dtype if self.model_dtype is not None else self.dtype
+    
+    def get_authoritative_dtype(self) -> torch.dtype:
+        """Get the authoritative dtype for the entire model
+        
+        Returns:
+            Authoritative dtype to be used throughout the pipeline
+        """
+        if hasattr(self, 'authoritative_dtype') and self.authoritative_dtype is not None:
+            return self.authoritative_dtype
+        elif self.model_dtype is not None:
+            return self.model_dtype
+        else:
+            return self.dtype
     
     def map_model_weights(self) -> Dict[str, str]:
         """Create mapping of layer names to weight files"""
@@ -474,6 +500,73 @@ class SequentialModelLoader:
         
         return hidden_states
     
+    def _convert_weight_dtype(self, weight: torch.Tensor, target_dtype: torch.dtype, weight_name: str) -> torch.Tensor:
+        """Convert weight tensor to target dtype if needed
+        
+        Args:
+            weight: Weight tensor to convert
+            target_dtype: Target dtype
+            weight_name: Name of weight for logging
+            
+        Returns:
+            Weight tensor with correct dtype
+        """
+        if weight is None:
+            self.logger.debug(f"Weight {weight_name} is None, skipping conversion")
+            return weight
+            
+        if not torch.is_tensor(weight):
+            self.logger.warning(f"Weight {weight_name} is not a tensor: {type(weight)}")
+            return weight
+            
+        if weight.dtype != target_dtype:
+            # Special handling for integer tensors (don't convert)
+            if not weight.dtype.is_floating_point:
+                self.logger.debug(f"Skipping conversion for non-float tensor {weight_name}: {weight.dtype}")
+                return weight
+                
+            self.logger.debug(f"Converting {weight_name} from {weight.dtype} to {target_dtype}")
+            return weight.to(dtype=target_dtype)
+        return weight
+    
+    def _validate_layer_weights(self, weights: Dict[str, torch.Tensor], layer_idx: int) -> Dict[str, torch.Tensor]:
+        """Validate and clean layer weights
+        
+        Args:
+            weights: Dictionary of weight tensors
+            layer_idx: Layer index
+            
+        Returns:
+            Cleaned weight dictionary
+        """
+        cleaned_weights = {}
+        
+        for weight_name, weight_tensor in weights.items():
+            # Skip None weights
+            if weight_tensor is None:
+                self.logger.debug(f"Skipping None weight: {weight_name}")
+                continue
+                
+            # Validate tensor
+            if not torch.is_tensor(weight_tensor):
+                self.logger.warning(f"Skipping non-tensor weight {weight_name}: {type(weight_tensor)}")
+                continue
+                
+            # Check for NaN/Inf
+            if torch.isnan(weight_tensor).any() or torch.isinf(weight_tensor).any():
+                self.logger.warning(f"Weight {weight_name} contains NaN/Inf, skipping")
+                continue
+                
+            # Check for empty tensors
+            if weight_tensor.numel() == 0:
+                self.logger.warning(f"Weight {weight_name} is empty, skipping")
+                continue
+                
+            cleaned_weights[weight_name] = weight_tensor
+        
+        self.logger.debug(f"Layer {layer_idx}: {len(cleaned_weights)}/{len(weights)} weights valid")
+        return cleaned_weights
+    
     def construct_transformer_layer(self,
                                layer_idx: int,
                                weights: Dict[str, torch.Tensor]) -> nn.Module:
@@ -481,6 +574,9 @@ class SequentialModelLoader:
         
         Returns a proper nn.Module with attention and MLP components
         """
+        
+        # Validate and clean weights first
+        weights = self._validate_layer_weights(weights, layer_idx)
         
         class TransformerLayer(nn.Module):
             """GLM Transformer layer with GQA support"""
@@ -498,22 +594,32 @@ class SequentialModelLoader:
                 self.q_size = self.num_heads * self.head_dim  # 96 * 128 = 12,288
                 self.kv_size = self.num_kv_heads * self.head_dim  # 8 * 128 = 1,024
                 
-                # Attention components - ensure LayerNorm uses the correct dtype
+                # Precompute scale factor as tensor in correct dtype to avoid runtime dtype changes
+                import math
+                self.scale_factor = torch.tensor(math.sqrt(self.head_dim), dtype=dtype)
+                
+                # Attention components - ensure ALL modules use the correct dtype
                 self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5, dtype=dtype)
                 self.attention = nn.ModuleDict({
-                    'q_proj': nn.Linear(self.hidden_size, self.q_size, bias=False),
-                    'k_proj': nn.Linear(self.hidden_size, self.kv_size, bias=False),
-                    'v_proj': nn.Linear(self.hidden_size, self.kv_size, bias=False),
-                    'o_proj': nn.Linear(self.q_size, self.hidden_size, bias=False),
+                    'q_proj': nn.Linear(self.hidden_size, self.q_size, bias=False, dtype=dtype),
+                    'k_proj': nn.Linear(self.hidden_size, self.kv_size, bias=False, dtype=dtype),
+                    'v_proj': nn.Linear(self.hidden_size, self.kv_size, bias=False, dtype=dtype),
+                    'o_proj': nn.Linear(self.q_size, self.hidden_size, bias=False, dtype=dtype),
                 })
+                # Force attention modules to correct dtype  
+                for name, module in self.attention.items():
+                    self.attention[name] = module.to(dtype)
                 
-                # MLP components - ensure LayerNorm uses the correct dtype
+                # MLP components - ensure ALL modules use the correct dtype
                 self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5, dtype=dtype)
                 self.mlp = nn.ModuleDict({
-                    'gate_proj': nn.Linear(self.hidden_size, self.intermediate_size, bias=False),
-                    'up_proj': nn.Linear(self.hidden_size, self.intermediate_size, bias=False),
-                    'down_proj': nn.Linear(self.intermediate_size, self.hidden_size, bias=False),
+                    'gate_proj': nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=dtype),
+                    'up_proj': nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=dtype),
+                    'down_proj': nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=dtype),
                 })
+                # Force MLP modules to correct dtype
+                for name, module in self.mlp.items():
+                    self.mlp[name] = module.to(dtype)
             
             @property
             def device(self):
@@ -522,8 +628,12 @@ class SequentialModelLoader:
             
             def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
                 """Forward pass with GQA attention"""
+                # Store original dtype for potential conversion back
+                original_dtype = hidden_states.dtype
+                
                 # Ensure input is in the correct dtype
                 if hasattr(self, 'dtype') and hidden_states.dtype != self.dtype:
+                    self.logger.debug(f"Converting input from {hidden_states.dtype} to {self.dtype}")
                     hidden_states = hidden_states.to(self.dtype)
                 
                 batch_size, seq_len, _ = hidden_states.shape
@@ -531,9 +641,10 @@ class SequentialModelLoader:
                 
                 # Input layer norm
                 normed = self.input_layernorm(hidden_states)
-                # Ensure norm output maintains dtype
-                if normed.dtype != hidden_states.dtype:
-                    normed = normed.to(hidden_states.dtype)
+                # LayerNorm should preserve dtype if created correctly, but verify
+                if normed.dtype != self.dtype:
+                    self.logger.debug(f"LayerNorm output dtype mismatch: {normed.dtype} vs {self.dtype}")
+                    normed = normed.to(self.dtype)
                 
                 # Compute Q, K, V projections with different sizes
                 q = self.attention['q_proj'](normed)  # [batch, seq, 12288]
@@ -551,9 +662,19 @@ class SequentialModelLoader:
                     k = k.repeat_interleave(repeat_factor, dim=1)
                     v = v.repeat_interleave(repeat_factor, dim=1)
                 
-                # Compute attention scores
-                scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+                # Compute attention scores - use precomputed tensor scale factor
+                scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale_factor
+                
+                # Ensure scores maintain dtype after division
+                if scores.dtype != hidden_states.dtype:
+                    scores = scores.to(hidden_states.dtype)
+                
                 attn_weights = torch.softmax(scores, dim=-1)
+                
+                # Ensure softmax output maintains dtype
+                if attn_weights.dtype != hidden_states.dtype:
+                    attn_weights = attn_weights.to(hidden_states.dtype)
+                
                 attn_output = torch.matmul(attn_weights, v)
                 
                 # Reshape back
@@ -580,15 +701,22 @@ class SequentialModelLoader:
                 # Final residual connection
                 hidden_states = residual + mlp_output
                 
+                # Ensure output dtype matches expected dtype
+                if hidden_states.dtype != self.dtype:
+                    hidden_states = hidden_states.to(self.dtype)
+                
                 return hidden_states
         
-        # Create layer module with actual config and detected dtype
-        # Use the model's detected dtype for consistency
-        layer_dtype = self.model_dtype if self.model_dtype is not None else torch.float16
+        # Create layer module with actual config and authoritative dtype
+        # Use the authoritative dtype for consistency
+        layer_dtype = self.get_authoritative_dtype()
         layer = TransformerLayer(self.config, dtype=layer_dtype)
+        layer = layer.to(dtype=layer_dtype)  # Actually convert the layer to the correct dtype
         
         # Store layer name for reference
         layer._layer_name = f"transformer.layers.{layer_idx}"
+        
+        self.logger.debug(f"Created TransformerLayer {layer_idx} with dtype: {layer_dtype}")
         
         # Load weights into the module (rest remains the same)
         for weight_name, weight_tensor in weights.items():
@@ -610,40 +738,67 @@ class SequentialModelLoader:
                     if 'weight' in component_name:
                         # Convert to module's dtype if needed
                         target_dtype = layer.input_layernorm.weight.dtype
-                        if weight_tensor.dtype != target_dtype:
-                            self.logger.debug(f"Converting {component_name} from {weight_tensor.dtype} to {target_dtype}")
-                            weight_tensor = weight_tensor.to(dtype=target_dtype)
+                        weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                         layer.input_layernorm.weight.data = weight_tensor
                     elif 'bias' in component_name:
-                        target_dtype = layer.input_layernorm.bias.dtype if layer.input_layernorm.bias is not None else weight_tensor.dtype
-                        if weight_tensor.dtype != target_dtype:
-                            weight_tensor = weight_tensor.to(dtype=target_dtype)
-                        layer.input_layernorm.bias.data = weight_tensor
+                        if layer.input_layernorm.bias is not None:
+                            target_dtype = layer.input_layernorm.bias.dtype
+                            weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
+                            layer.input_layernorm.bias.data = weight_tensor
                 
                 elif 'q_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.attention['q_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.attention['q_proj'].weight.data = weight_tensor
                 elif 'k_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.attention['k_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.attention['k_proj'].weight.data = weight_tensor
                 elif 'v_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.attention['v_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.attention['v_proj'].weight.data = weight_tensor
                 elif 'o_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.attention['o_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.attention['o_proj'].weight.data = weight_tensor
                 
                 # Load MLP weights
                 elif 'post_attention_layernorm' in component_name:
                     if 'weight' in component_name:
+                        target_dtype = layer.post_attention_layernorm.weight.dtype
+                        weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                         layer.post_attention_layernorm.weight.data = weight_tensor
                     elif 'bias' in component_name:
-                        layer.post_attention_layernorm.bias.data = weight_tensor
+                        if layer.post_attention_layernorm.bias is not None:
+                            target_dtype = layer.post_attention_layernorm.bias.dtype
+                            weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
+                            layer.post_attention_layernorm.bias.data = weight_tensor
                 
                 elif 'gate_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.mlp['gate_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.mlp['gate_proj'].weight.data = weight_tensor
                 elif 'up_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.mlp['up_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.mlp['up_proj'].weight.data = weight_tensor
                 elif 'down_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.mlp['down_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.mlp['down_proj'].weight.data = weight_tensor
         
-        self.logger.debug(f"Constructed transformer layer {layer_idx}")
+        # Log final dtype state
+        param_dtypes = set()
+        for param in layer.parameters():
+            param_dtypes.add(param.dtype)
+        
+        if len(param_dtypes) > 1:
+            self.logger.warning(f"Layer {layer_idx} has mixed dtypes: {param_dtypes}")
+        else:
+            self.logger.debug(f"Constructed transformer layer {layer_idx} with uniform dtype: {param_dtypes.pop()}")
+        
+        layer = layer.to(dtype=layer_dtype) 
         return layer
     
     def construct_moe_layer(self,
@@ -671,37 +826,37 @@ class SequentialModelLoader:
                 self.kv_size = self.num_kv_heads * self.head_dim
                 assert self.num_experts > 0, f"num_experts must be positive, got {self.num_experts}"
                 
-                # Attention components (same as transformer)
-                self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5)
+                # Attention components (same as transformer) - with explicit dtype
+                self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5, dtype=dtype)
                 self.attention = nn.ModuleDict({
-                    'q_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False),
-                    'k_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False),
-                    'v_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False),
-                    'o_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+                    'q_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False, dtype=dtype),
+                    'k_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False, dtype=dtype),
+                    'v_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False, dtype=dtype),
+                    'o_proj': nn.Linear(self.hidden_size, self.hidden_size, bias=False, dtype=dtype),
                 })
                 
-                # MoE components
-                self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5)
-                self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+                # MoE components - with explicit dtype
+                self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=1e-5, dtype=dtype)
+                self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False, dtype=dtype)
                 
-                # Create experts
+                # Create experts with explicit dtype
                 self.experts = nn.ModuleList()
                 for _ in range(self.num_experts):
                     expert = nn.ModuleDict({
-                        'gate_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
-                        'up_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
-                        'down_proj': nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False),
+                        'gate_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False, dtype=dtype),
+                        'up_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False, dtype=dtype),
+                        'down_proj': nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False, dtype=dtype),
                     })
                     self.experts.append(expert)
                 
-                # Shared experts if applicable
+                # Shared experts if applicable - with explicit dtype
                 if self.num_shared_experts > 0:
                     self.shared_experts = nn.ModuleList()
                     for _ in range(self.num_shared_experts):
                         expert = nn.ModuleDict({
-                            'gate_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
-                            'up_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
-                            'down_proj': nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False),
+                            'gate_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False, dtype=dtype),
+                            'up_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False, dtype=dtype),
+                            'down_proj': nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False, dtype=dtype),
                         })
                         self.shared_experts.append(expert)
             @property
@@ -714,6 +869,13 @@ class SequentialModelLoader:
                 
                 Implements actual expert selection and weighted combination
                 """
+                # Store original dtype
+                original_dtype = hidden_states.dtype
+                
+                # Ensure input is in the correct dtype
+                if hasattr(self, 'dtype') and hidden_states.dtype != self.dtype:
+                    hidden_states = hidden_states.to(self.dtype)
+                
                 # Validate and reshape input
                 if hasattr(self, '_parent_loader'):
                     hidden_states = self._parent_loader._validate_and_reshape_input(hidden_states, self.hidden_size)
@@ -742,9 +904,21 @@ class SequentialModelLoader:
                 k = k.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
                 v = v.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
                 
-                # Compute attention
-                scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
+                # Compute attention - use precomputed scale to maintain dtype
+                import math
+                scale_factor = math.sqrt(head_dim)
+                scores = torch.matmul(q, k.transpose(-2, -1)) / scale_factor
+                
+                # Ensure dtype consistency after operations
+                if scores.dtype != hidden_states.dtype:
+                    scores = scores.to(hidden_states.dtype)
+                
                 attn_weights = torch.softmax(scores, dim=-1)
+                
+                # Ensure softmax maintains dtype
+                if attn_weights.dtype != hidden_states.dtype:
+                    attn_weights = attn_weights.to(hidden_states.dtype)
+                
                 attn_output = torch.matmul(attn_weights, v)
                 
                 # Reshape back
@@ -791,8 +965,18 @@ class SequentialModelLoader:
                         # Compute expert output
                         gate = expert['gate_proj'](expert_input)
                         up = expert['up_proj'](expert_input)
-                        gate = gate * torch.sigmoid(gate)  # SwiGLU activation
+                        
+                        # Ensure activation maintains dtype
+                        gate_activated = torch.sigmoid(gate)
+                        if gate_activated.dtype != gate.dtype:
+                            gate_activated = gate_activated.to(gate.dtype)
+                        
+                        gate = gate * gate_activated  # SwiGLU activation
                         expert_out = expert['down_proj'](gate * up)
+                        
+                        # Ensure output maintains dtype
+                        if expert_out.dtype != hidden_states.dtype:
+                            expert_out = expert_out.to(hidden_states.dtype)
                         
                         # Get weights for this expert
                         expert_weights = torch.zeros(len(normed_flat), device=normed.device)
@@ -824,9 +1008,15 @@ class SequentialModelLoader:
                 
                 return hidden_states
         
-        # Create MoE layer with detected dtype
-        layer_dtype = self.model_dtype if self.model_dtype is not None else torch.float16
+        # Create MoE layer with authoritative dtype
+        layer_dtype = self.get_authoritative_dtype()
         layer = MoELayer(self.config, dtype=layer_dtype)
+        layer = layer.to(dtype=layer_dtype)  # Actually convert the layer to the correct dtype
+        
+        # Store layer name for reference
+        layer._layer_name = f"transformer.layers.{layer_idx}"
+        
+        self.logger.debug(f"Created MoELayer {layer_idx} with dtype: {layer_dtype}")
         
         # Load weights into the module
         for weight_name, weight_tensor in weights.items():
@@ -843,20 +1033,33 @@ class SequentialModelLoader:
             if f"layers.{layer_idx}." in weight_name:
                 component_name = weight_name.split(f"layers.{layer_idx}.")[-1]
                 
-                # Load attention weights (same as transformer)
+                # Load attention weights (same as transformer) - with dtype conversion
                 if 'input_layernorm' in component_name:
                     if 'weight' in component_name:
+                        target_dtype = layer.input_layernorm.weight.dtype
+                        weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                         layer.input_layernorm.weight.data = weight_tensor
                     elif 'bias' in component_name:
-                        layer.input_layernorm.bias.data = weight_tensor
+                        if hasattr(layer.input_layernorm, 'bias') and layer.input_layernorm.bias is not None:
+                            target_dtype = layer.input_layernorm.bias.dtype
+                            weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
+                            layer.input_layernorm.bias.data = weight_tensor
                 
                 elif 'q_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.attention['q_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.attention['q_proj'].weight.data = weight_tensor
                 elif 'k_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.attention['k_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.attention['k_proj'].weight.data = weight_tensor
                 elif 'v_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.attention['v_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.attention['v_proj'].weight.data = weight_tensor
                 elif 'o_proj' in component_name and 'weight' in component_name:
+                    target_dtype = layer.attention['o_proj'].weight.dtype
+                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                     layer.attention['o_proj'].weight.data = weight_tensor
                 
                 # Load post attention layernorm
@@ -892,13 +1095,29 @@ class SequentialModelLoader:
                             if expert_idx < len(layer.experts):
                                 expert = layer.experts[expert_idx]
                                 if 'gate_proj' in component_name and 'weight' in component_name:
+                                    target_dtype = expert['gate_proj'].weight.dtype
+                                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                                     expert['gate_proj'].weight.data = weight_tensor
                                 elif 'up_proj' in component_name and 'weight' in component_name:
+                                    target_dtype = expert['up_proj'].weight.dtype
+                                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                                     expert['up_proj'].weight.data = weight_tensor
                                 elif 'down_proj' in component_name and 'weight' in component_name:
+                                    target_dtype = expert['down_proj'].weight.dtype
+                                    weight_tensor = self._convert_weight_dtype(weight_tensor, target_dtype, component_name)
                                     expert['down_proj'].weight.data = weight_tensor
         
-        self.logger.debug(f"Constructed MoE layer {layer_idx} with {self.num_experts} experts")
+        # Log final dtype state
+        param_dtypes = set()
+        for param in layer.parameters():
+            param_dtypes.add(param.dtype)
+        
+        if len(param_dtypes) > 1:
+            self.logger.warning(f"MoE layer {layer_idx} has mixed dtypes: {param_dtypes}")
+        else:
+            self.logger.debug(f"Constructed MoE layer {layer_idx} with {self.num_experts} experts, uniform dtype: {param_dtypes.pop()}")
+        
+        layer = layer.to(dtype=layer_dtype) 
         return layer
     
     def save_quantized_layer(self, 
@@ -968,8 +1187,12 @@ class SequentialModelLoader:
             raise ValueError("No embedding weights found")
         
         vocab_size, hidden_size = embed_weight.shape
-        embedding = nn.Embedding(vocab_size, hidden_size)
+        # Create embedding with detected dtype
+        dtype = embed_weight.dtype
+        embedding = nn.Embedding(vocab_size, hidden_size, dtype=dtype)
         embedding.weight.data = embed_weight
+        
+        self.logger.debug(f"Created embedding layer with dtype: {dtype}")
         
         return embedding
     

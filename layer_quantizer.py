@@ -13,6 +13,107 @@ import time
 import gc
 
 
+class DtypeValidationWrapper(nn.Module):
+    """Wrapper to validate and enforce dtype consistency during forward pass"""
+    
+    def __init__(self, module: nn.Module, expected_dtype: torch.dtype, layer_name: str = "unknown"):
+        """Initialize dtype validation wrapper
+        
+        Args:
+            module: Module to wrap
+            expected_dtype: Expected dtype for inputs/outputs
+            layer_name: Name of layer for logging
+        """
+        super().__init__()
+        self.module = module
+        self.expected_dtype = expected_dtype
+        self.layer_name = layer_name
+        self.logger = logging.getLogger(__name__)
+        self.dtype_mismatches = []
+        
+    def forward(self, *args, **kwargs):
+        """Forward pass with dtype validation"""
+        # Check input dtypes
+        input_dtypes = []
+        for i, arg in enumerate(args):
+            if torch.is_tensor(arg):
+                input_dtypes.append((f"arg_{i}", arg.dtype))
+                if arg.dtype != self.expected_dtype:
+                    self.logger.warning(f"[{self.layer_name}] Input arg_{i} dtype mismatch: "
+                                      f"expected {self.expected_dtype}, got {arg.dtype}")
+                    self.dtype_mismatches.append({
+                        'layer': self.layer_name,
+                        'type': 'input',
+                        'name': f'arg_{i}',
+                        'expected': self.expected_dtype,
+                        'actual': arg.dtype
+                    })
+                    # Auto-convert with warning
+                    args = list(args)
+                    args[i] = arg.to(self.expected_dtype)
+                    
+        for key, value in kwargs.items():
+            if torch.is_tensor(value):
+                input_dtypes.append((key, value.dtype))
+                if value.dtype != self.expected_dtype:
+                    self.logger.warning(f"[{self.layer_name}] Input {key} dtype mismatch: "
+                                      f"expected {self.expected_dtype}, got {value.dtype}")
+                    self.dtype_mismatches.append({
+                        'layer': self.layer_name,
+                        'type': 'input',
+                        'name': key,
+                        'expected': self.expected_dtype,
+                        'actual': value.dtype
+                    })
+                    # Auto-convert with warning
+                    kwargs[key] = value.to(self.expected_dtype)
+        
+        # Run forward pass
+        output = self.module(*args, **kwargs)
+        
+        # Check output dtype
+        if torch.is_tensor(output):
+            if output.dtype != self.expected_dtype:
+                self.logger.warning(f"[{self.layer_name}] Output dtype mismatch: "
+                                  f"expected {self.expected_dtype}, got {output.dtype}")
+                self.dtype_mismatches.append({
+                    'layer': self.layer_name,
+                    'type': 'output',
+                    'name': 'output',
+                    'expected': self.expected_dtype,
+                    'actual': output.dtype
+                })
+                # Auto-convert output
+                output = output.to(self.expected_dtype)
+        elif isinstance(output, tuple):
+            # Handle tuple outputs
+            output_list = list(output)
+            for i, out in enumerate(output_list):
+                if torch.is_tensor(out) and out.dtype != self.expected_dtype:
+                    self.logger.warning(f"[{self.layer_name}] Output[{i}] dtype mismatch: "
+                                      f"expected {self.expected_dtype}, got {out.dtype}")
+                    self.dtype_mismatches.append({
+                        'layer': self.layer_name,
+                        'type': 'output',
+                        'name': f'output_{i}',
+                        'expected': self.expected_dtype,
+                        'actual': out.dtype
+                    })
+                    output_list[i] = out.to(self.expected_dtype)
+            output = tuple(output_list)
+        
+        return output
+    
+    def get_validation_report(self) -> Dict[str, Any]:
+        """Get validation report for this layer"""
+        return {
+            'layer_name': self.layer_name,
+            'expected_dtype': str(self.expected_dtype),
+            'num_mismatches': len(self.dtype_mismatches),
+            'mismatches': self.dtype_mismatches
+        }
+
+
 @dataclass
 class LayerQuantizationResult:
     """Results from quantizing a single layer"""
@@ -186,6 +287,14 @@ class LayerQuantizer:
         self.config = config
         self.memory_manager = memory_manager
         self.model_loader = model_loader  # Reference to model loader for dtype info
+        self.authoritative_dtype = None  # Will be set from model_loader
+        self.logger = logging.getLogger(__name__)
+        
+        # Get and store authoritative dtype if model_loader is provided
+        if self.model_loader is not None:
+            self.authoritative_dtype = self.model_loader.get_authoritative_dtype()
+            self.logger.info(f"LayerQuantizer using authoritative dtype: {self.authoritative_dtype}")
+        
         self.awq_scales = {}  # Cache scales across layers
         self.quantization_cache = {}  # Cache for reuse
         self.logger = logging.getLogger(__name__)
@@ -211,6 +320,62 @@ class LayerQuantizer:
         from metrics import MetricsCollector
         self.metrics_collector = MetricsCollector()
         
+    def _handle_mixed_precision_layer(self, layer: nn.Module, layer_name: str, target_dtype: torch.dtype) -> nn.Module:
+        """Handle layers with mixed precision parameters
+        
+        Args:
+            layer: Layer with mixed precision
+            layer_name: Name of layer
+            target_dtype: Target dtype to convert to
+            
+        Returns:
+            Layer with unified dtype
+        """
+        self.logger.info(f"[{layer_name}] Converting mixed precision layer to {target_dtype}")
+        
+        conversion_count = 0
+        for name, param in layer.named_parameters():
+            if param.dtype != target_dtype:
+                self.logger.debug(f"  Converting {name} from {param.dtype} to {target_dtype}")
+                # Create new parameter with correct dtype
+                with torch.no_grad():
+                    param.data = param.data.to(target_dtype)
+                conversion_count += 1
+        
+        # Also convert buffers
+        for name, buffer in layer.named_buffers():
+            if buffer.dtype.is_floating_point and buffer.dtype != target_dtype:
+                self.logger.debug(f"  Converting buffer {name} from {buffer.dtype} to {target_dtype}")
+                with torch.no_grad():
+                    buffer.data = buffer.data.to(target_dtype)
+                conversion_count += 1
+        
+        if conversion_count > 0:
+            self.logger.info(f"[{layer_name}] Converted {conversion_count} parameters/buffers to {target_dtype}")
+        
+        return layer
+    
+    def wrap_layer_with_validation(self, layer: nn.Module, layer_name: str) -> nn.Module:
+        """Wrap layer with dtype validation
+        
+        Args:
+            layer: Layer to wrap
+            layer_name: Name of layer
+            
+        Returns:
+            Wrapped layer with dtype validation
+        """
+        if self.authoritative_dtype is not None:
+            expected_dtype = self.authoritative_dtype
+        elif self.model_loader is not None:
+            expected_dtype = self.model_loader.get_authoritative_dtype()
+        else:
+            # Fallback to detecting from layer
+            expected_dtype = next(layer.parameters()).dtype
+        
+        self.logger.debug(f"Wrapping {layer_name} with dtype validation (expected: {expected_dtype})")
+        return DtypeValidationWrapper(layer, expected_dtype, layer_name)
+    
     def quantize_layer(self, 
                    layer: torch.nn.Module, 
                    layer_name: str,
@@ -218,6 +383,14 @@ class LayerQuantizer:
         """Quantize a single layer using AWQ with error recovery"""
         start_time = time.time()
         self.logger.info(f"Starting quantization of layer: {layer_name}")
+        
+        # Handle None calibration data
+        if calibration_data is None:
+            self.logger.warning(f"[{layer_name}] Calibration data is None, generating synthetic data")
+            hidden_size = self._get_hidden_size(layer)
+            device = next(layer.parameters()).device
+            dtype = self.authoritative_dtype if self.authoritative_dtype else torch.float16
+            calibration_data = torch.randn(1, 128, hidden_size, device=device, dtype=dtype) * 0.02
         
         # Type checking and logging for calibration data
         self.logger.debug(f"[TYPE_CHECK] quantize_layer received calibration_data type: {type(calibration_data)}")
@@ -313,7 +486,29 @@ class LayerQuantizer:
         
         # Move layer to GPU if needed and possible
         device = self._determine_device(layer, original_size_gb)
-        layer = layer.to(device)
+        # Move to device AND ensure correct dtype
+        if self.authoritative_dtype is not None:
+            layer = layer.to(device=device, dtype=self.authoritative_dtype)
+        else:
+            layer = layer.to(device)
+        # Force convert all Linear module weights directly
+        if self.authoritative_dtype is not None:
+            with torch.no_grad():
+                for module in layer.modules():
+                    if isinstance(module, nn.Linear):
+                        module.weight = nn.Parameter(module.weight.to(self.authoritative_dtype))
+                        if module.bias is not None:
+                            module.bias = nn.Parameter(module.bias.to(self.authoritative_dtype))
+        # Force all submodules to the correct dtype
+        for module in layer.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.data = module.weight.data.to(self.authoritative_dtype)
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(self.authoritative_dtype)
+        
+        # Log the actual device the layer is on
+        actual_device = next(layer.parameters()).device
+        self.logger.debug(f"Layer {layer_name} moved to device: {device}, actual device: {actual_device}")
         
         # Detect layer's expected dtype - prefer model loader info if available
         if self.model_loader is not None:
@@ -324,16 +519,28 @@ class LayerQuantizer:
             layer_dtype = next(layer.parameters()).dtype
             self.logger.debug(f"Layer {layer_name} expects dtype from parameters: {layer_dtype}")
         
+        # CRITICAL: Use the actual device of the layer, not the intended device
+        # This handles cases where .to(device) might fail silently
+        layer_device = next(layer.parameters()).device
+        
         # Handle calibration_data device placement AND dtype conversion
-        self.logger.debug(f"Moving calibration data to device: {device} with dtype: {layer_dtype}")
+        self.logger.debug(f"Moving calibration data to device: {layer_device} with dtype: {layer_dtype}")
         
         if isinstance(calibration_data, dict):
             # Move dictionary contents to device AND convert dtype for float tensors
             calibration_data_device = {}
             for key, value in calibration_data.items():
                 if torch.is_tensor(value):
-                    # Move to device
-                    moved_tensor = value.to(device)
+                    # CRITICAL: Move to the actual device of the layer
+                    moved_tensor = value.to(layer_device)
+                    
+                    # Verify the tensor actually moved
+                    if moved_tensor.device != layer_device:
+                        self.logger.error(f"Failed to move {key} to {layer_device}, still on {moved_tensor.device}")
+                        # Force CPU if device mismatch persists
+                        layer = layer.to('cpu')
+                        layer_device = torch.device('cpu')
+                        moved_tensor = value.to('cpu')
                     
                     # Convert dtype only for floating point tensors (not for int input_ids)
                     if moved_tensor.dtype.is_floating_point and moved_tensor.dtype != layer_dtype:
@@ -341,7 +548,7 @@ class LayerQuantizer:
                         moved_tensor = moved_tensor.to(dtype=layer_dtype)
                     
                     calibration_data_device[key] = moved_tensor
-                    self.logger.debug(f"Moved {key} tensor to {device}: shape={moved_tensor.shape}, dtype={moved_tensor.dtype}")
+                    self.logger.debug(f"Moved {key} tensor to {layer_device}: shape={moved_tensor.shape}, dtype={moved_tensor.dtype}")
                 else:
                     calibration_data_device[key] = value
                     self.logger.debug(f"Kept {key} as-is: type={type(value)}")
@@ -462,6 +669,10 @@ class LayerQuantizer:
             # Validate quantization - FIX: Pass calibration_data
             error = self.validate_quantized_layer(layer, quantized_layer, calibration_data)
             
+            # Validate quantized layer dtypes
+            if self.authoritative_dtype is not None:
+                self._validate_layer_dtypes(quantized_layer, f"{layer_name}_quantized", self.authoritative_dtype)
+            
             # Calculate quantized size
             quantized_size_gb = self._calculate_layer_size(quantized_layer)
             self.total_quantized_size += quantized_size_gb
@@ -537,6 +748,59 @@ class LayerQuantizer:
             )
             return layer, result
     
+    def _validate_layer_dtypes(self, layer: nn.Module, layer_name: str, expected_dtype: torch.dtype) -> bool:
+        """Validate all parameters in layer have consistent dtype
+        
+        Args:
+            layer: Layer to validate
+            layer_name: Name of layer for logging
+            expected_dtype: Expected dtype
+            
+        Returns:
+            True if all dtypes match expected
+        """
+        param_dtypes = {}
+        mismatches = []
+        dtype_counts = {}
+        
+        for name, param in layer.named_parameters():
+            param_dtypes[name] = param.dtype
+            dtype_counts[param.dtype] = dtype_counts.get(param.dtype, 0) + 1
+            if param.dtype != expected_dtype:
+                mismatches.append(f"{name}: {param.dtype} (expected {expected_dtype})")
+        
+        # Detect mixed precision scenario
+        if len(dtype_counts) > 1:
+            self.logger.warning(f"[{layer_name}] MIXED PRECISION DETECTED:")
+            for dtype, count in dtype_counts.items():
+                self.logger.warning(f"  - {dtype}: {count} parameters")
+            
+            # Determine best dtype to use (most common or highest precision)
+            if torch.bfloat16 in dtype_counts and dtype_counts[torch.bfloat16] > len(param_dtypes) * 0.5:
+                recommended_dtype = torch.bfloat16
+            elif torch.float16 in dtype_counts and dtype_counts[torch.float16] > len(param_dtypes) * 0.5:
+                recommended_dtype = torch.float16
+            else:
+                # Use highest precision dtype found
+                if torch.float32 in dtype_counts:
+                    recommended_dtype = torch.float32
+                elif torch.bfloat16 in dtype_counts:
+                    recommended_dtype = torch.bfloat16
+                else:
+                    recommended_dtype = torch.float16
+            
+            self.logger.info(f"[{layer_name}] Recommended dtype for mixed precision: {recommended_dtype}")
+            return False
+            
+        if mismatches:
+            self.logger.warning(f"[{layer_name}] Found dtype mismatches in parameters:")
+            for mismatch in mismatches:
+                self.logger.warning(f"  - {mismatch}")
+            return False
+        else:
+            self.logger.debug(f"[{layer_name}] All parameters have consistent dtype: {expected_dtype}")
+            return True
+    
     def collect_layer_activations(self,
                              layer: torch.nn.Module,
                              calibration_data: torch.Tensor,
@@ -573,7 +837,7 @@ class LayerQuantizer:
                 # Store input activations for AWQ scaling
                 if isinstance(input, tuple):
                     input = input[0]
-                activations[name] = input.detach().cpu()
+                activations[name] = input.detach()  # Keep on same device as module
             return hook_fn
         
         # Register hooks on all Linear layers
@@ -604,23 +868,27 @@ class LayerQuantizer:
             # FIX: Properly prepare hidden_states tensor - with careful extraction
             hidden_states = None
             
-            # Get the layer's expected dtype - check all parameters for consistency
+            # Get the layer's expected dtype - use authoritative if available
             layer_device = next(layer.parameters()).device
             
-            # Check dtypes of all parameters to handle mixed precision
-            param_dtypes = set()
-            for param in layer.parameters():
-                param_dtypes.add(param.dtype)
-            
-            # If mixed dtypes, prefer bfloat16 > float16 > float32
-            if torch.bfloat16 in param_dtypes:
-                layer_dtype = torch.bfloat16
-            elif torch.float16 in param_dtypes:
-                layer_dtype = torch.float16
+            if self.authoritative_dtype is not None:
+                layer_dtype = self.authoritative_dtype
+                self.logger.debug(f"Using authoritative dtype: {layer_dtype}, device={layer_device}")
             else:
-                layer_dtype = next(layer.parameters()).dtype
-            
-            self.logger.debug(f"Layer dtypes found: {param_dtypes}, using: {layer_dtype}, device={layer_device}")
+                # Check dtypes of all parameters to handle mixed precision
+                param_dtypes = set()
+                for param in layer.parameters():
+                    param_dtypes.add(param.dtype)
+                
+                # If mixed dtypes, prefer bfloat16 > float16 > float32
+                if torch.bfloat16 in param_dtypes:
+                    layer_dtype = torch.bfloat16
+                elif torch.float16 in param_dtypes:
+                    layer_dtype = torch.float16
+                else:
+                    layer_dtype = next(layer.parameters()).dtype
+                
+                self.logger.debug(f"Layer dtypes found: {param_dtypes}, using: {layer_dtype}, device={layer_device}")
             
             # Handle different calibration_data formats
             if isinstance(calibration_data, torch.Tensor):
@@ -669,7 +937,7 @@ class LayerQuantizer:
                             device=layer_device,  # Use already detected device
                             dtype=layer_dtype  # Use already detected dtype
                         ) * 0.02
-                        self.logger.debug(f"Generated synthetic hidden states for {layer_name}: shape={hidden_states.shape}")
+                        self.logger.debug(f"Generated synthetic hidden states for {layer_name}: shape={hidden_states.shape}, dtype={hidden_states.dtype}")
             elif hasattr(calibration_data, 'input_ids'):
                 # CalibrationSample object
                 # Try cached activations first
@@ -717,8 +985,21 @@ class LayerQuantizer:
                 hidden_size = self._get_hidden_size(layer)
                 hidden_states = torch.randn(1, 128, hidden_size, device=layer_device, dtype=layer_dtype) * 0.02
             
-            # Move to layer device and ensure correct dtype
+           # Move to layer device and ensure correct dtype
             hidden_states = hidden_states.to(device=layer_device, dtype=layer_dtype)
+            
+            # Verify all layer parameters are on the same device
+            param_devices = set()
+            for param in layer.parameters():
+                param_devices.add(param.device)
+            
+            if len(param_devices) > 1:
+                self.logger.error(f"Layer {layer_name} has parameters on multiple devices: {param_devices}")
+                # Force all to CPU as fallback
+                layer = layer.to('cpu')
+                layer_device = torch.device('cpu')
+                hidden_states = hidden_states.to('cpu')
+                self.logger.info(f"Forced {layer_name} and inputs to CPU due to mixed devices")
             
             # Run forward pass to collect activations
             try:
@@ -726,9 +1007,24 @@ class LayerQuantizer:
                 if not isinstance(hidden_states, torch.Tensor):
                     self.logger.error(f"hidden_states is not a tensor before forward pass: {type(hidden_states)}")
                     hidden_size = self._get_hidden_size(layer)
-                    hidden_states = torch.randn(1, 128, hidden_size, device=layer.device, dtype=torch.float16) * 0.02
+                    # Use layer_device instead of layer.device to ensure consistency
+                    hidden_states = torch.randn(1, 128, hidden_size, device=layer_device, dtype=layer_dtype) * 0.02
                 
-                output = layer(hidden_states)
+                # Final device check before forward pass
+                actual_layer_device = next(layer.parameters()).device
+                if hidden_states.device != actual_layer_device:
+                    self.logger.warning(f"Device mismatch before forward: input on {hidden_states.device}, layer on {actual_layer_device}")
+                    hidden_states = hidden_states.to(actual_layer_device)
+                
+                # Wrap layer with validation for debugging if needed
+                if self.logger.level <= logging.DEBUG:
+                    validation_wrapper = DtypeValidationWrapper(layer, layer_dtype, layer_name)
+                    output = validation_wrapper(hidden_states)
+                    # Log any mismatches found
+                    if validation_wrapper.dtype_mismatches:
+                        self.logger.debug(f"Dtype mismatches during activation collection: {validation_wrapper.get_validation_report()}")
+                else:
+                    output = layer(hidden_states)
                 
                 # Cache output for next layer
                 if isinstance(output, tuple):
@@ -746,6 +1042,66 @@ class LayerQuantizer:
             handle.remove()
         
         return activations
+    
+    def collect_layer_activations_multi_batch(self,
+                                         layer: torch.nn.Module,
+                                         calibration_dataloader: Any,
+                                         layer_name: str,
+                                         num_batches: int = 4) -> Dict[str, torch.Tensor]:
+        """Collect activations from multiple batches for better statistics
+        
+        Args:
+            layer: Layer module to collect activations from
+            calibration_dataloader: DataLoader with calibration samples
+            layer_name: Name of the layer for caching
+            num_batches: Number of batches to accumulate
+            
+        Returns:
+            Dictionary of module_name -> accumulated activation tensors
+        """
+        accumulated_activations = {}
+        handles = []
+        
+        def create_hook(name):
+            def hook_fn(module, input, output):
+                if isinstance(input, tuple):
+                    input = input[0]
+                if name not in accumulated_activations:
+                    accumulated_activations[name] = []
+                accumulated_activations[name].append(input.detach().cpu())
+            return hook_fn
+        
+        # Register hooks on all Linear layers
+        for name, module in layer.named_modules():
+            if isinstance(module, nn.Linear):
+                handle = module.register_forward_hook(create_hook(name))
+                handles.append(handle)
+        
+        # Collect from multiple batches
+        batch_count = 0
+        for batch in calibration_dataloader:
+            if batch_count >= num_batches:
+                break
+                
+            # Process batch (similar to existing logic)
+            with torch.no_grad():
+                # ... (prepare batch as before)
+                _ = layer(hidden_states)
+            
+            batch_count += 1
+        
+        # Remove hooks
+        for handle in handles:
+            handle.remove()
+        
+        # Concatenate accumulated activations
+        final_activations = {}
+        for name, activation_list in accumulated_activations.items():
+            if activation_list:
+                final_activations[name] = torch.cat(activation_list, dim=0)
+                self.logger.debug(f"Collected {final_activations[name].shape[0]} total samples for {name}")
+        
+        return final_activations
     
     def _get_next_layer_name(self, current_layer_name: str) -> Optional[str]:
         """Get the name of the next layer in sequence"""
@@ -769,6 +1125,19 @@ class LayerQuantizer:
                 return current_layer_name.replace(f'layers.{current_idx}', f'layers.{prev_idx}')
         return None
     
+    def _create_scalar_tensor(self, value: float, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Create a scalar tensor with specific dtype and device
+        
+        Args:
+            value: Scalar value
+            dtype: Target dtype
+            device: Target device
+            
+        Returns:
+            Scalar tensor
+        """
+        return torch.tensor(value, dtype=dtype, device=device)
+    
     def compute_awq_scales(self,
                       layer: torch.nn.Module,
                       calibration_data: Any,
@@ -790,11 +1159,15 @@ class LayerQuantizer:
             # Create emergency fallback data
             # Create fallback with correct dtype
             hidden_size = self._get_hidden_size(layer)
-            # Get the layer's expected dtype
-            layer_dtype = next(layer.parameters()).dtype
+            # Use authoritative dtype if available
+            if self.authoritative_dtype is not None:
+                layer_dtype = self.authoritative_dtype
+            else:
+                layer_dtype = next(layer.parameters()).dtype
+            
             calibration_data = torch.randn(1, 128, hidden_size,
                                         device=next(layer.parameters()).device,
-                                        dtype=layer_dtype) * 0.02  # Use layer's dtype, not hardcoded float16
+                                        dtype=layer_dtype) * 0.02
             self.logger.warning(f"[TYPE_RECOVERY] Using synthetic data shape {calibration_data.shape} with dtype {layer_dtype}")
         
         # FIX: Extract actual tensor if calibration_data is a dict - PROPERLY
@@ -928,23 +1301,27 @@ class LayerQuantizer:
                 scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
                 continue
             
-            X = activations[name]
+            X = activations[name].to(module.weight.device)  # Ensure same device
             W = module.weight
-            
-            # Ensure we have enough samples for statistics
-            if X.shape[0] < 4:
-                self.logger.warning(f"Too few samples ({X.shape[0]}) for {name}, using default scales")
-                scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
-                continue
             
             # Reshape activations to [batch*seq_len, hidden] for better statistics
             orig_shape = X.shape
             if X.dim() == 3:
-                X = X.reshape(-1, X.shape[-1])
+                batch_size, seq_len, hidden_dim = X.shape
+                X = X.reshape(-1, hidden_dim)  # This flattens batch*seq_len
+                # Now X.shape[0] = batch_size * seq_len, giving us many more samples
+                self.logger.debug(f"Reshaped {name} activations from {orig_shape} to {X.shape} ({batch_size}*{seq_len} = {X.shape[0]} samples)")
             elif X.dim() == 2:
                 pass  # Already correct shape
             else:
                 self.logger.warning(f"Unexpected activation shape {orig_shape} for {name}")
+                scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
+                continue
+            
+            # Ensure we have enough samples for statistics
+            # Note: After reshaping, we have batch_size * seq_len samples
+            if X.shape[0] < 4:
+                self.logger.warning(f"Too few samples ({X.shape[0]}) for {name} after reshaping, using default scales")
                 scales[name] = torch.ones(module.weight.shape[1], device=module.weight.device)
                 continue
             
@@ -999,12 +1376,19 @@ class LayerQuantizer:
             small_weight_mask = W_max < (W_max.mean() * 0.1)
             scale[small_weight_mask] *= 0.5
             
-            # Apply damping for numerical stability
-            damping = self.config.awq_damping_percent
-            scale = scale * (1 - damping) + 1.0 * damping
+            # Apply damping for numerical stability using tensor operations
+            damping = self._create_scalar_tensor(
+                self.config.awq_damping_percent, 
+                scale.dtype, 
+                scale.device
+            )
+            one = self._create_scalar_tensor(1.0, scale.dtype, scale.device)
+            scale = scale * (one - damping) + one * damping
             
-            # Clip to reasonable range
-            scale = torch.clamp(scale, min=0.01, max=100.0)
+            # Clip to reasonable range using tensor bounds
+            min_val = self._create_scalar_tensor(0.01, scale.dtype, scale.device)
+            max_val = self._create_scalar_tensor(100.0, scale.dtype, scale.device)
+            scale = torch.clamp(scale, min=min_val, max=max_val)
             
             # Smooth the scales to avoid sudden changes
             if scale.shape[0] > 1:
@@ -1017,11 +1401,16 @@ class LayerQuantizer:
                     kernel = torch.ones(1, 1, kernel_size, device=scale.device) / kernel_size
                     scale = torch.nn.functional.conv1d(scale_padded, kernel).squeeze()
             
+            # Ensure scale is on the same device as the module weight
+            if scale.device != module.weight.device:
+                self.logger.debug(f"Moving scale from {scale.device} to {module.weight.device}")
+                scale = scale.to(module.weight.device)
+            
             scales[name] = scale
             
             self.logger.debug(f"Computed scales for {name}: mean={scale.mean():.3f}, "
                             f"std={scale.std():.3f}, min={scale.min():.3f}, max={scale.max():.3f}, "
-                            f"salient={num_salient}/{len(scale)}")
+                            f"salient={num_salient}/{len(scale)}, device={scale.device}")
         
         return scales
     
@@ -1190,16 +1579,20 @@ class LayerQuantizer:
         batch_size = 1
         seq_length = 128
         
-        # Get the layer's expected dtype from its parameters
-        layer_dtype = next(layer.parameters()).dtype
+        # Use authoritative dtype if available, otherwise get from layer
+        if self.authoritative_dtype is not None:
+            layer_dtype = self.authoritative_dtype
+        else:
+            layer_dtype = next(layer.parameters()).dtype
+        
         layer_device = next(layer.parameters()).device
         
-        self.logger.debug(f"Creating dummy input with dtype={layer_dtype}, device={layer_device}")
+        self.logger.debug(f"Creating dummy input with dtype={layer_dtype} (authoritative: {self.authoritative_dtype}), device={layer_device}")
         
         return torch.randn(
             batch_size, seq_length, hidden_size,
             device=layer_device,
-            dtype=layer_dtype  # Use layer's dtype, not hardcoded float16
+            dtype=layer_dtype  # Use authoritative or layer's dtype
         ) * 0.02  # Proper initialization scale
     
     def apply_awq_quantization(self,
@@ -1214,6 +1607,11 @@ class LayerQuantizer:
         3. Compute zero points and scales per group
         4. Quantize to INT4
         """
+        # Ensure scales and weights are on the same device
+        if scales.device != weight.device:
+            self.logger.debug(f"Moving scales from {scales.device} to weight device {weight.device}")
+            scales = scales.to(weight.device)
+        
         # Apply AWQ scales
         scaled_weight = weight * scales.unsqueeze(0)
         
@@ -1844,6 +2242,13 @@ class LayerQuantizer:
         - Dequantizes on-the-fly during forward
         - Compatible with vLLM kernels
         """
+        
+        # Handle case where original has bias but it's None
+        if hasattr(original, 'bias') and original.bias is None:
+            bias = None
+        elif bias is not None and bias.numel() == 0:
+            # Handle empty bias tensor
+            bias = None
         
         class QuantizedLinear(nn.Module):
             """Quantized linear layer with on-the-fly dequantization"""

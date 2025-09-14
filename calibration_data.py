@@ -60,17 +60,21 @@ class CalibrationDataHandler:
                  tokenizer: Any,
                  max_length: int = 2048,
                  num_samples: int = 128,
-                 hidden_size: int = 4096):
+                 hidden_size: int = 4096,
+                 dtype: torch.dtype = torch.float16):
         """Initialize calibration data handler"""
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.num_samples = num_samples
         self.hidden_size = hidden_size
+        self.dtype = dtype  # Store authoritative dtype
         self.logger = logging.getLogger(__name__)
         
         # Storage for processed samples
         self.raw_data = []
         self.processed_samples = []
+        
+        self.logger.info(f"CalibrationDataHandler initialized with dtype: {self.dtype}")
         
     def load_calibration_dataset(self, 
                             dataset_name: str = "c4",
@@ -267,11 +271,18 @@ class CalibrationDataHandler:
     
     def prepare_calibration_data(self, 
                             batch_size: int = 2,
-                            dtype: torch.dtype = torch.float16) -> DataLoader:
+                            dtype: torch.dtype = None) -> DataLoader:
         """Prepare calibration data loader - SIMPLIFIED with dtype control"""
         if not self.raw_data:
             self.logger.warning("No raw data loaded, generating synthetic data")
             self._generate_synthetic_data()
+        
+        # Use stored authoritative dtype if not explicitly provided
+        if dtype is None:
+            dtype = self.dtype
+        
+        # Store the dtype we're using for this preparation
+        self.current_dtype = dtype
         
         # Tokenize all samples
         self.logger.info(f"Tokenizing {len(self.raw_data)} samples with dtype={dtype}")
@@ -383,7 +394,7 @@ class CalibrationDataHandler:
                                seq_length: int = None,
                                device: str = 'cpu',
                                return_tokens: bool = False,
-                               dtype: torch.dtype = torch.float16) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+                               dtype: torch.dtype = None) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """Generate calibration inputs for layer processing
         
         Args:
@@ -391,7 +402,7 @@ class CalibrationDataHandler:
             seq_length: Sequence length (uses max_length if None)
             device: Device to place tensors on
             return_tokens: If True, return tokenized data instead of hidden states
-            dtype: Data type for generated tensors (default: float16)
+            dtype: Data type for generated tensors (uses stored dtype if None)
             
         Returns:
             Tensor of shape [batch_size, seq_length, hidden_size] or dict with tokens
@@ -399,7 +410,11 @@ class CalibrationDataHandler:
         if seq_length is None:
             seq_length = self.max_length
         
-        self.logger.debug(f"Generating calibration inputs with dtype={dtype}")
+        # Use authoritative dtype if not explicitly specified
+        if dtype is None:
+            dtype = self.dtype
+        
+        self.logger.debug(f"Generating calibration inputs with dtype={dtype} (authoritative: {self.dtype})")
         
         if return_tokens and self.processed_samples:
             # Return actual tokenized data for proper forward pass
@@ -449,7 +464,7 @@ class CalibrationDataHandler:
                 self.num_samples,
                 seq_length,
                 hidden_size,
-                dtype=torch.float16,
+                dtype=dtype,  # Use the dtype parameter (which defaults to self.dtype)
                 device=device
             ) * 0.02
             
@@ -467,7 +482,8 @@ class CalibrationDataHandler:
                             batch_size: int = 1,
                             hidden_size: int = 4096,
                             seq_length: int = None,
-                            device: str = 'cpu') -> Dict[str, torch.Tensor]:
+                            device: str = 'cpu',
+                            dtype: torch.dtype = None) -> Dict[str, torch.Tensor]:
         """Get a batch of calibration data in the format expected by layers
         
         Args:
@@ -475,15 +491,22 @@ class CalibrationDataHandler:
             hidden_size: Model hidden dimension  
             seq_length: Sequence length
             device: Device to place tensors on
+            dtype: Data type for tensors (uses stored dtype if None)
             
         Returns:
             Dictionary with 'hidden_states' and optionally 'attention_mask'
         """
         if seq_length is None:
             seq_length = self.max_length
+        
+        # Use stored dtype if not provided
+        if dtype is None:
+            dtype = self.dtype
             
-        # Get hidden states
-        all_hidden_states = self.get_calibration_inputs(hidden_size, seq_length, device)
+        # Get hidden states with correct dtype
+        all_hidden_states = self.get_calibration_inputs(
+            hidden_size, seq_length, device, dtype=dtype
+        )
         
         # Select batch
         if all_hidden_states.shape[0] > batch_size:
@@ -492,11 +515,11 @@ class CalibrationDataHandler:
         else:
             hidden_states = all_hidden_states[:batch_size]
         
-        # Create attention mask (all ones for now - no padding)
+        # Create attention mask (all ones for now - no padding) with correct dtype
         attention_mask = torch.ones(
             hidden_states.shape[0], 
             seq_length,
-            dtype=torch.float16,
+            dtype=dtype,  # Use the same dtype as hidden states
             device=device
         )
         
