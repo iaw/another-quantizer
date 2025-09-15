@@ -553,7 +553,7 @@ class LLMCompressorWrapper:
             "layernorm",
             "ln_f",
             "norm",
-        ]
+        ] # shared_expert and o_project failing
         
         for pattern in skip_patterns:
             if pattern in layer_name.lower():

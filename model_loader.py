@@ -350,6 +350,7 @@ class SequentialModelLoader:
                 raise KeyError(f"Layer {layer_name} not found")
         
         layer_info = self.layer_info[layer_name]
+        self.logger.info(f"[DEBUG] Loading {layer_name}: layer_type='{layer_info.layer_type}', is_moe={layer_info.is_moe}")
         self.logger.info(f"Loading layer: {layer_name} (type: {layer_info.layer_type}, "
                         f"size: {layer_info.estimated_size_gb:.2f}GB)")
         
@@ -397,6 +398,9 @@ class SequentialModelLoader:
             return self._construct_output_layer(weights)
         elif layer_info.layer_type == 'layernorm':
             return self._construct_layernorm(weights)
+        elif layer_info.layer_type == 'shared_expert' or layer_info.layer_type == 'moe_expert':
+            # Shared experts and individual experts should be constructed as MLP modules only
+            return self._construct_expert_module(layer_info.layer_index, weights)
         elif layer_info.is_moe:
             return self.construct_moe_layer(layer_info.layer_index, weights)
         else:
@@ -722,11 +726,8 @@ class SequentialModelLoader:
         self.logger.debug(f"Created TransformerLayer {layer_idx} with dtype: {layer_dtype}")
         
         # ADD THESE DEBUG LINES:
-        self.logger.info(f"[DEBUG] About to load {len(weights)} weights into layer {layer_idx}")
-        self.logger.info(f"[DEBUG] Weight names available: {list(weights.keys())}")
         # CRITICAL FIX: Force all weights to layer_dtype immediately
         for weight_name, weight_tensor in weights.items():
-            self.logger.info(f"[DEBUG] Processing weight: {weight_name}, dtype: {weight_tensor.dtype}, shape: {weight_tensor.shape}")
             # Validate tensor
             if weight_tensor is None:
                 self.logger.warning(f"None tensor for {weight_name}")
@@ -764,7 +765,7 @@ class SequentialModelLoader:
                             layer.input_layernorm.bias = nn.Parameter(weight_tensor.to(layer_dtype))
                 
                 elif 'q_proj' in component_name and 'weight' in component_name:
-                    self.logger.info(f"[DEBUG] Assigning q_proj weight, tensor dtype: {weight_tensor.dtype}, target dtype: {layer_dtype}")
+                    
                     # Replace entire Linear module with correct dtype
                     old_linear = layer.attention['q_proj']
                     new_linear = nn.Linear(old_linear.in_features, old_linear.out_features, 
@@ -878,11 +879,6 @@ class SequentialModelLoader:
             layer = layer.to(dtype=layer_dtype)
         else:
             self.logger.debug(f"Constructed transformer layer {layer_idx} with uniform dtype: {param_dtypes.pop()}")
-        
-        self.logger.info(f"[DEBUG] Final layer {layer_idx} parameter dtypes:")
-        for name, param in layer.named_parameters():
-            if 'proj' in name:
-                self.logger.info(f"[DEBUG] Final {name}: dtype={param.dtype}, device={param.device}")
         
         return layer
     
@@ -1357,6 +1353,203 @@ class SequentialModelLoader:
                 embedding_weights.update(weights)
         
         return self._construct_embedding_layer(embedding_weights)
+    
+    def _construct_expert_module(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Construct a single expert module (shared or regular MoE expert)
+        
+        This handles individual expert modules that are loaded separately,
+        not as part of a full transformer layer.
+        """
+        print("_construct_expert_module called")
+        # Validate and clean weights first
+        weights = self._validate_layer_weights(weights, layer_idx)
+        
+        class ExpertModule(nn.Module):
+            """Single expert MLP module for MoE layers"""
+            
+            def __init__(self, config: Dict[str, Any], dtype: torch.dtype = torch.float16):
+                super().__init__()
+                self.dtype = dtype
+                self.hidden_size = config['hidden_size']
+                
+                # Determine intermediate size based on expert type
+                # Shared experts typically use full intermediate_size
+                # Regular experts use smaller moe_intermediate_size
+                self.intermediate_size = config.get('intermediate_size', 10944)
+                self.moe_intermediate_size = config.get('moe_intermediate_size', 1408)
+                
+                # We'll determine the actual size from the weights if possible
+                self.actual_intermediate_size = self.intermediate_size
+                
+                # Create MLP components with explicit dtype
+                self.gate_proj = nn.Linear(self.hidden_size, self.actual_intermediate_size, bias=False, dtype=dtype)
+                self.up_proj = nn.Linear(self.hidden_size, self.actual_intermediate_size, bias=False, dtype=dtype)
+                self.down_proj = nn.Linear(self.actual_intermediate_size, self.hidden_size, bias=False, dtype=dtype)
+                
+            @property
+            def device(self):
+                """Get device of the module"""
+                return next(self.parameters()).device
+            
+            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+                """Forward pass for expert module
+                
+                Implements SwiGLU activation: gate(x) * sigmoid(gate(x)) * up(x) -> down
+                """
+                # Store original dtype
+                original_dtype = hidden_states.dtype
+                
+                # Ensure input is in the correct dtype
+                if hasattr(self, 'dtype') and hidden_states.dtype != self.dtype:
+                    hidden_states = hidden_states.to(self.dtype)
+                
+                # Ensure proper shape [batch, seq_len, hidden_size]
+                if hidden_states.dim() == 2:
+                    hidden_states = hidden_states.unsqueeze(0)
+                elif hidden_states.dim() != 3:
+                    raise ValueError(f"Expected 2D or 3D input, got {hidden_states.dim()}D")
+                
+                # MLP with SwiGLU activation
+                gate = self.gate_proj(hidden_states)
+                up = self.up_proj(hidden_states)
+                
+                # SwiGLU activation: gate * sigmoid(gate) * up
+                gate_activated = gate * torch.sigmoid(gate)
+                
+                # Ensure activation maintains dtype
+                if gate_activated.dtype != self.dtype:
+                    gate_activated = gate_activated.to(self.dtype)
+                
+                # Down projection
+                expert_output = self.down_proj(gate_activated * up)
+                
+                # Ensure output dtype matches expected
+                if expert_output.dtype != self.dtype:
+                    expert_output = expert_output.to(self.dtype)
+                
+                return expert_output
+        
+        # Get authoritative dtype
+        layer_dtype = self.get_authoritative_dtype()
+        
+        # Create expert module with config
+        expert = ExpertModule(self.config, dtype=layer_dtype)
+        expert = expert.to(dtype=layer_dtype)
+        
+        # Store layer name for reference
+        expert._layer_name = f"model.layers.{layer_idx}.mlp.expert"
+        
+        self.logger.debug(f"Created ExpertModule for layer {layer_idx} with dtype: {layer_dtype}")
+        
+        # Detect actual intermediate size from weights if available
+        actual_intermediate_size = None
+        for weight_name in weights.keys():
+            if 'gate_proj.weight' in weight_name or 'up_proj.weight' in weight_name:
+                weight_tensor = weights[weight_name]
+                if weight_tensor is not None and torch.is_tensor(weight_tensor):
+                    # Shape should be [intermediate_size, hidden_size]
+                    actual_intermediate_size = weight_tensor.shape[0]
+                    self.logger.debug(f"Detected intermediate_size from weights: {actual_intermediate_size}")
+                    break
+        
+        # If we detected a different size, recreate the layers with correct dimensions
+        if actual_intermediate_size and actual_intermediate_size != expert.actual_intermediate_size:
+            expert.actual_intermediate_size = actual_intermediate_size
+            expert.gate_proj = nn.Linear(expert.hidden_size, actual_intermediate_size, bias=False, dtype=layer_dtype)
+            expert.up_proj = nn.Linear(expert.hidden_size, actual_intermediate_size, bias=False, dtype=layer_dtype)
+            expert.down_proj = nn.Linear(actual_intermediate_size, expert.hidden_size, bias=False, dtype=layer_dtype)
+            self.logger.info(f"Adjusted expert intermediate_size to {actual_intermediate_size}")
+        
+        # Load weights into the module
+        for weight_name, weight_tensor in weights.items():
+            # Validate tensor
+            if weight_tensor is None:
+                self.logger.warning(f"None tensor for {weight_name}")
+                continue
+            
+            # Force dtype conversion
+            if torch.is_tensor(weight_tensor):
+                weight_tensor = weight_tensor.to(layer_dtype)
+            
+            if torch.isnan(weight_tensor).any() or torch.isinf(weight_tensor).any():
+                self.logger.warning(f"NaN/Inf detected in {weight_name}")
+                continue
+            
+            # Extract component name and load weight
+            # Handle different naming patterns
+            if 'gate_proj' in weight_name and 'weight' in weight_name:
+                # Replace entire Linear module with correct dtype
+                old_linear = expert.gate_proj
+                new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                    bias=(old_linear.bias is not None), dtype=layer_dtype)
+                new_linear.weight = nn.Parameter(weight_tensor.to(layer_dtype))
+                expert.gate_proj = new_linear
+                self.logger.debug(f"Loaded gate_proj weight: shape={weight_tensor.shape}")
+                
+            elif 'up_proj' in weight_name and 'weight' in weight_name:
+                # Replace entire Linear module with correct dtype
+                old_linear = expert.up_proj
+                new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                    bias=(old_linear.bias is not None), dtype=layer_dtype)
+                new_linear.weight = nn.Parameter(weight_tensor.to(layer_dtype))
+                expert.up_proj = new_linear
+                self.logger.debug(f"Loaded up_proj weight: shape={weight_tensor.shape}")
+                
+            elif 'down_proj' in weight_name and 'weight' in weight_name:
+                # Replace entire Linear module with correct dtype
+                old_linear = expert.down_proj
+                new_linear = nn.Linear(old_linear.in_features, old_linear.out_features,
+                                    bias=(old_linear.bias is not None), dtype=layer_dtype)
+                new_linear.weight = nn.Parameter(weight_tensor.to(layer_dtype))
+                expert.down_proj = new_linear
+                self.logger.debug(f"Loaded down_proj weight: shape={weight_tensor.shape}")
+        
+        # Force all parameters to layer_dtype
+        self.logger.debug(f"Enforcing dtype {layer_dtype} for all parameters in expert module")
+        conversion_count = 0
+        
+        for name, param in list(expert.named_parameters()):
+            if param.dtype != layer_dtype:
+                self.logger.debug(f"Converting parameter {name} from {param.dtype} to {layer_dtype}")
+                
+                # Create new Parameter with correct dtype
+                new_param = nn.Parameter(param.data.to(layer_dtype))
+                
+                # Find the parent module and parameter name to replace it
+                if '.' in name:
+                    parent_name, param_name = name.rsplit('.', 1)
+                    parent_module = expert
+                    for part in parent_name.split('.'):
+                        parent_module = getattr(parent_module, part)
+                    setattr(parent_module, param_name, new_param)
+                else:
+                    setattr(expert, name, new_param)
+                
+                conversion_count += 1
+        
+        # Also enforce dtype for buffers
+        for name, buffer in expert.named_buffers():
+            if buffer.dtype.is_floating_point and buffer.dtype != layer_dtype:
+                self.logger.debug(f"Converting buffer {name} from {buffer.dtype} to {layer_dtype}")
+                buffer.data = buffer.data.to(layer_dtype)
+                conversion_count += 1
+        
+        if conversion_count > 0:
+            self.logger.info(f"Forced {conversion_count} parameters/buffers to {layer_dtype} in expert module")
+        
+        # Verify final dtype state
+        param_dtypes = set()
+        for param in expert.parameters():
+            param_dtypes.add(param.dtype)
+        
+        if len(param_dtypes) > 1:
+            self.logger.error(f"Expert module still has mixed dtypes after enforcement: {param_dtypes}")
+            # Force one more time with the whole module
+            expert = expert.to(dtype=layer_dtype)
+        else:
+            self.logger.debug(f"Constructed expert module with uniform dtype: {param_dtypes.pop()}")
+        
+        return expert
     
     def _construct_embedding_layer(self, weights: Dict[str, torch.Tensor]) -> nn.Module:
         """Construct embedding layer from weights"""

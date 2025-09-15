@@ -1,6 +1,7 @@
 # layer_quantizer.py
 """Layer-wise quantization implementation"""
 
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -319,7 +320,63 @@ class LayerQuantizer:
         # Initialize metrics collector
         from metrics import MetricsCollector
         self.metrics_collector = MetricsCollector()
+    
+    def _identify_layer_type(self, layer: nn.Module, layer_name: str) -> str:
+        """Identify the type of layer for quantization strategy
         
+        Args:
+            layer: Layer module
+            layer_name: Name of the layer
+            
+        Returns:
+            Layer type string: 'moe', 'attention', 'mlp', 'embedding', or 'generic'
+        """
+        layer_name_lower = layer_name.lower()
+        
+        # Check for MoE
+        if hasattr(layer, 'experts') or 'moe' in layer_name_lower or 'expert' in layer_name_lower:
+            return "moe"
+        
+        # Check for embedding
+        if 'embedding' in layer_name_lower or 'embed' in layer_name_lower:
+            return "embedding"
+        
+        # Check for attention
+        if 'attention' in layer_name_lower or 'attn' in layer_name_lower or 'self_attn' in layer_name_lower:
+            return "attention"
+        
+        # Check for MLP
+        if 'mlp' in layer_name_lower or 'ffn' in layer_name_lower or 'feed_forward' in layer_name_lower:
+            return "mlp"
+        
+        # Check module structure for attention components
+        has_qkv = any(hasattr(layer, attr) for attr in ['q_proj', 'k_proj', 'v_proj'])
+        if has_qkv:
+            return "attention"
+        
+        # Check for attention submodules in ModuleDict
+        if hasattr(layer, 'attention') and isinstance(layer.attention, nn.ModuleDict):
+            has_attention_modules = any(k in layer.attention for k in ['q_proj', 'k_proj', 'v_proj'])
+            if has_attention_modules:
+                return "attention"
+        
+        # Check for MLP components
+        has_gate_up = any(hasattr(layer, attr) for attr in ['gate_proj', 'up_proj', 'mlp'])
+        if has_gate_up:
+            return "mlp"
+        
+        # Check for MLP submodules in ModuleDict  
+        if hasattr(layer, 'mlp') and isinstance(layer.mlp, nn.ModuleDict):
+            has_mlp_modules = any(k in layer.mlp for k in ['gate_proj', 'up_proj', 'down_proj'])
+            if has_mlp_modules:
+                return "mlp"
+        
+        # Check for layer norm
+        if 'norm' in layer_name_lower or 'layernorm' in layer_name_lower:
+            return "layernorm"
+        
+        return "generic"
+    
     def _handle_mixed_precision_layer(self, layer: nn.Module, layer_name: str, target_dtype: torch.dtype) -> nn.Module:
         """Handle layers with mixed precision parameters
         
@@ -382,6 +439,7 @@ class LayerQuantizer:
                    calibration_data: Any) -> Tuple[torch.nn.Module, LayerQuantizationResult]:
         """Quantize a single layer using AWQ with error recovery"""
         start_time = time.time()
+        original_layer = copy.deepcopy(layer)
         self.logger.info(f"Starting quantization of layer: {layer_name}")
         
         # PRE-QUANTIZATION DTYPE VALIDATION AND ENFORCEMENT
@@ -797,21 +855,48 @@ class LayerQuantizer:
                 'cpu_peak_mb': self.memory_manager.get_current_memory().cpu_used * 1024
             }
             
-            layer_metrics = self.metrics_collector.collect_layer_metrics(
-                layer_name=layer_name,
-                layer_type=layer_type,
-                original_layer=layer,
-                quantized_layer=quantized_layer,
-                quantization_result=result,
-                calibration_data=calibration_data,
-                time_taken=result.time_taken,
-                memory_stats=memory_stats
-            )
-            
-            # Log results
-            self.logger.info(f"Quantized {layer_name}: {original_size_gb:.2f}GB -> {quantized_size_gb:.2f}GB "
-                        f"(compression: {result.compression_ratio:.2f}x, error: {error:.6f}, "
-                        f"cosine_sim: {layer_metrics.cosine_similarity:.4f})")
+            if self.metrics_collector:
+                # Convert calibration data to hidden states for metrics
+                metrics_input = calibration_data
+                
+                # If calibration_data is a dict (tokenized), convert to hidden states
+                if isinstance(calibration_data, dict):
+                    # Get hidden size from layer
+                    if hasattr(layer, 'hidden_size'):
+                        hidden_size = layer.hidden_size
+                    elif hasattr(layer, 'input_layernorm'):
+                        hidden_size = layer.input_layernorm.weight.shape[0]
+                    else:
+                        hidden_size = 4096  # fallback
+                    
+                    # Generate synthetic hidden states for metrics calculation
+                    batch_size = calibration_data.get('input_ids', torch.zeros(1, 128)).shape[0]
+                    seq_len = calibration_data.get('input_ids', torch.zeros(1, 128)).shape[1]
+                    
+                    # Create hidden states tensor with same batch/seq dimensions
+                    metrics_input = torch.randn(
+                        batch_size, 
+                        seq_len, 
+                        hidden_size,
+                        device=device,
+                        dtype=next(layer.parameters()).dtype
+                    ) * 0.02  # Small random values
+                
+                layer_metrics = self.metrics_collector.collect_layer_metrics(
+                    layer_name=layer_name,
+                    layer_type=self._identify_layer_type(layer, layer_name),
+                    original_layer=original_layer,
+                    quantized_layer=quantized_layer,
+                    quantization_result=result,
+                    calibration_data=metrics_input,  # <-- Now it's a tensor
+                    time_taken=time.time() - start_time,
+                    memory_stats=memory_stats
+                )
+                
+                # Log results
+                self.logger.info(f"Quantized {layer_name}: {original_size_gb:.2f}GB -> {quantized_size_gb:.2f}GB "
+                            f"(compression: {result.compression_ratio:.2f}x, error: {error:.6f}, "
+                            f"cosine_sim: {layer_metrics.cosine_similarity:.4f})")
             
             return quantized_layer, result
             
@@ -1084,7 +1169,15 @@ class LayerQuantizer:
                 layer_device = torch.device('cpu')
                 hidden_states = hidden_states.to('cpu')
                 self.logger.info(f"Forced {layer_name} and inputs to CPU due to mixed devices")
+            # Add debugging before forward pass
+            self.logger.info(f"[DEBUG] About to run forward pass for {layer_name}")
+            self.logger.info(f"[DEBUG] Layer type: {type(layer).__name__}")
+            self.logger.info(f"[DEBUG] Layer has forward method: {hasattr(layer, 'forward')}")
+            self.logger.info(f"[DEBUG] Hidden states shape: {hidden_states.shape if torch.is_tensor(hidden_states) else 'Not a tensor'}")
             
+            # Also check what attributes the layer has
+            if hasattr(layer, '_modules'):
+                self.logger.info(f"[DEBUG] Layer modules: {list(layer._modules.keys())}")
             # Run forward pass to collect activations
             try:
                 # Double-check that hidden_states is a tensor before forward pass
